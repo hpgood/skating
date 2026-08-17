@@ -5,8 +5,8 @@ import (
 	"os"
 	"sort"
 
+	"github.com/hpgood/skating/internal/i18n"
 	"github.com/hpgood/skating/internal/store"
-
 	"github.com/spf13/cobra"
 )
 
@@ -14,15 +14,15 @@ var logLast int
 var logID int
 
 var logsCmd = &cobra.Command{
-	Use:   "logs <项目名>",
-	Short: "View logs",
+	Use:   "logs <project-name>",
+	Short: i18n.T("查看日志", "View logs"),
 	Args:  cobra.ExactArgs(1),
 	RunE:  runLogs,
 }
 
 func init() {
-	logsCmd.Flags().IntVar(&logLast, "last", 0, "显示最近 N 次构建日志摘要")
-	logsCmd.Flags().IntVar(&logID, "id", 0, "查看指定构建ID的完整日志")
+	logsCmd.Flags().IntVar(&logLast, "last", 0, i18n.T("显示最近 N 次构建日志摘要", "show summary of last N builds"))
+	logsCmd.Flags().IntVar(&logID, "id", 0, i18n.T("查看指定构建ID的完整日志", "show full log for build ID N"))
 }
 
 func runLogs(cmd *cobra.Command, args []string) error {
@@ -30,16 +30,16 @@ func runLogs(cmd *cobra.Command, args []string) error {
 
 	s, err := store.NewStore()
 	if err != nil {
-		return fmt.Errorf("创建 store 失败: %w", err)
+		return fmt.Errorf(i18n.T("创建 store 失败: %w", "create store failed: %w"), err)
 	}
 
 	ids, err := s.ListLogs(projName)
 	if err != nil {
-		return fmt.Errorf("列出日志失败: %w", err)
+		return fmt.Errorf(i18n.T("列出日志失败: %w", "list logs failed: %w"), err)
 	}
 
 	if len(ids) == 0 {
-		fmt.Println("暂无构建记录")
+		fmt.Println(i18n.T("暂无构建记录", "No build records yet"))
 		return nil
 	}
 
@@ -47,10 +47,9 @@ func runLogs(cmd *cobra.Command, args []string) error {
 	sort.Sort(sort.Reverse(sort.IntSlice(ids)))
 
 	if logID > 0 {
-		// 查看指定构建ID的完整日志
 		logContent, err := s.GetLog(projName, logID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			fmt.Fprintf(os.Stderr, i18n.T("错误: %v\n", "Error: %v\n"), err)
 			os.Exit(1)
 		}
 		fmt.Print(logContent)
@@ -58,7 +57,6 @@ func runLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	if logLast > 0 {
-		// 显示最近 N 次构建日志摘要
 		count := logLast
 		if count > len(ids) {
 			count = len(ids)
@@ -69,19 +67,15 @@ func runLogs(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				continue
 			}
-			// 尝试从日志内容第一行提取状态
 			status := "-"
-			timeStr := "-"
 			for _, line := range splitLines(info) {
 				if line == "" {
 					continue
 				}
-				// 简单取第一行非空内容作为摘要
 				status = line
 				break
 			}
-			_ = timeStr
-			fmt.Printf("构建ID: %d  状态: %s\n", buildID, status)
+			fmt.Printf(i18n.T("构建ID: %d  状态: %s\n", "Build ID: %d  Status: %s\n"), buildID, status)
 			fmt.Println("---")
 		}
 		return nil
@@ -91,7 +85,7 @@ func runLogs(cmd *cobra.Command, args []string) error {
 	latestID := ids[0]
 	logContent, err := s.GetLog(projName, latestID)
 	if err != nil {
-		return fmt.Errorf("读取日志失败: %w", err)
+		return fmt.Errorf(i18n.T("读取日志失败: %w", "read log failed: %w"), err)
 	}
 	fmt.Print(logContent)
 	return nil

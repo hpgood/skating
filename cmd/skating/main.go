@@ -4,16 +4,21 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/hpgood/skating/internal/i18n"
 	"github.com/hpgood/skating/internal/plugin"
 	"github.com/spf13/cobra"
 )
 
-var version = "0.1.0"
+var (
+	version = "dev"     // injected via -ldflags "-X main.version=1.0.0"
+	commit  = "none"    // injected via -ldflags "-X main.commit=abc123"
+	date    = "unknown" // injected via -ldflags "-X main.date=2024-01-01"
+	lang    string
+)
 
 func main() {
-	// 启动时加载用户插件目录（目录不存在则跳过）
 	if err := plugin.LoadPlugins("plugins"); err != nil {
-		fmt.Fprintf(os.Stderr, "加载插件失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "load plugins: %v\n", err)
 	}
 
 	if err := rootCmd.Execute(); err != nil {
@@ -24,13 +29,17 @@ func main() {
 
 var rootCmd = &cobra.Command{
 	Use:     "skating",
-	Short:   "skating is a CLI tool for project management",
-	Version: version,
+	Short:   "skating - lightweight CI/CD build tool (no database required)",
+	Version: fmt.Sprintf("%s (commit: %s, built: %s)", version, commit, date),
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		i18n.SetLang(lang)
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},
 }
 
 func init() {
-	rootCmd.AddCommand(initCmd, configCmd, lsCmd, runCmd, logsCmd)
+	rootCmd.PersistentFlags().StringVar(&lang, "lang", "en", "language (en, zh-CN)")
+	rootCmd.AddCommand(initCmd, configCmd, lsCmd, runCmd, logsCmd, cleanCmd, skillCmd, versionCmd)
 }

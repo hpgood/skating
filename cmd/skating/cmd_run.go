@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hpgood/skating/internal/executor"
+	"github.com/hpgood/skating/internal/i18n"
 	"github.com/hpgood/skating/internal/pipeline"
 	"github.com/hpgood/skating/internal/plugin"
 	"github.com/hpgood/skating/internal/store"
@@ -16,8 +17,8 @@ import (
 )
 
 var runCmd = &cobra.Command{
-	Use:   "run <项目名>",
-	Short: "Run a build",
+	Use:   "run <project-name>",
+	Short: i18n.T("运行构建", "Run a build"),
 	Args:  cobra.ExactArgs(1),
 	RunE:  runRun,
 }
@@ -25,39 +26,34 @@ var runCmd = &cobra.Command{
 func runRun(cmd *cobra.Command, args []string) error {
 	projName := args[0]
 
-	// 1. 获取项目信息
 	s, err := store.NewStore()
 	if err != nil {
-		return fmt.Errorf("创建 store 失败: %w", err)
+		return fmt.Errorf(i18n.T("创建 store 失败: %w", "create store failed: %w"), err)
 	}
 
 	project, err := s.GetProject(projName)
 	if err != nil {
-		return fmt.Errorf("项目 %q 不存在", projName)
+		return fmt.Errorf(i18n.T("项目 %q 不存在", "project %q not found"), projName)
 	}
 
-	// 2. 读取 .skating.yaml
 	configPath := filepath.Join(project.Path, ".skating.yaml")
 	pl, err := pipeline.LoadPipeline(configPath)
 	if err != nil {
-		return fmt.Errorf("加载 pipeline 配置失败: %w", err)
+		return fmt.Errorf(i18n.T("加载 pipeline 配置失败: %w", "load pipeline config failed: %w"), err)
 	}
 
-	// 读取镜像配置
 	image := readImage(configPath)
 
-	// 3. 获取构建编号
 	buildID, err := s.NextBuildID(projName)
 	if err != nil {
-		return fmt.Errorf("获取构建编号失败: %w", err)
+		return fmt.Errorf(i18n.T("获取构建编号失败: %w", "get build ID failed: %w"), err)
 	}
 
 	startTime := time.Now()
 
-	// 打印构建头部
-	fmt.Printf("=== 构建项目: %s (Build #%d) ===\n", projName, buildID)
+	fmt.Printf(i18n.T("=== 构建项目: %s (Build #%d) ===\n", "=== Build: %s (Build #%d) ===\n"), projName, buildID)
 	if image != "" {
-		fmt.Printf("Docker 镜像: %s\n", image)
+		fmt.Printf(i18n.T("Docker 镜像: %s\n", "Docker image: %s\n"), image)
 	}
 	fmt.Println()
 
@@ -93,25 +89,25 @@ func runRun(cmd *cobra.Command, args []string) error {
 	overallStatus := "success"
 	if runErr != nil {
 		overallStatus = "failure"
-		fmt.Printf("=== 构建失败: %v ===\n", runErr)
+		fmt.Printf(i18n.T("=== 构建失败: %v ===\n", "=== Build FAILED: %v ===\n"), runErr)
 	} else {
-		fmt.Println("=== 构建完成: success ===")
+		fmt.Println(i18n.T("=== 构建完成: success ===", "=== Build SUCCESS ==="))
 	}
 
 	// 7. 保存日志
 	if err := s.SaveLog(projName, buildID, &logBuf); err != nil {
-		fmt.Fprintf(os.Stderr, "警告: 保存日志失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("警告: 保存日志失败: %v\n", "Warning: save log failed: %v\n"), err)
 	} else {
 		home, _ := os.UserHomeDir()
 		logFilePath := filepath.Join(home, ".skating", "logs", projName, fmt.Sprintf("%d.log", buildID))
-		fmt.Printf("日志已保存: %s\n", logFilePath)
+		fmt.Printf(i18n.T("日志已保存: %s\n", "Log saved: %s\n"), logFilePath)
 	}
 
 	// 8. 更新项目状态
 	project.LastStatus = overallStatus
 	project.LastBuild = startTime.Format(time.RFC3339)
 	if err := s.SaveProject(project); err != nil {
-		fmt.Fprintf(os.Stderr, "警告: 更新项目状态失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("警告: 更新项目状态失败: %v\n", "Warning: update project status failed: %v\n"), err)
 	}
 
 	// 9. 打印构建摘要
@@ -172,7 +168,7 @@ func printSummary(results []*pipeline.PipelineResult, elapsed time.Duration) {
 		return
 	}
 
-	fmt.Println("--- 构建摘要 ---")
+	fmt.Println(i18n.T("--- 构建摘要 ---", "--- Build Summary ---"))
 	for _, r := range results {
 		icon := "✓"
 		if r.Status == "failed" {
@@ -182,5 +178,5 @@ func printSummary(results []*pipeline.PipelineResult, elapsed time.Duration) {
 		}
 		fmt.Printf("  [%s/%s] %s %s (%s)\n", r.StageName, r.StepName, icon, r.Status, r.Duration)
 	}
-	fmt.Printf("\n总耗时: %s\n", elapsed.Truncate(time.Millisecond))
+	fmt.Printf(i18n.T("\n总耗时: %s\n", "\nTotal time: %s\n"), elapsed.Truncate(time.Millisecond))
 }

@@ -199,6 +199,78 @@ func (s *Store) ListLogs(projectName string) ([]int, error) {
 	return ids, nil
 }
 
+// CleanLogs 清空指定项目的所有构建日志文件，保留 BuildID 和项目注册信息
+func (s *Store) CleanLogs(projectName string) (int, error) {
+	dir := s.logsDir(projectName)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read logs dir: %w", err)
+	}
+
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if err := os.Remove(path); err != nil {
+			return count, fmt.Errorf("remove %s: %w", entry.Name(), err)
+		}
+		count++
+	}
+	return count, nil
+}
+
+// CleanAllLogs 清空所有项目的构建日志
+func (s *Store) CleanAllLogs() (int, error) {
+	logsBase := filepath.Join(s.baseDir, "logs")
+	entries, err := os.ReadDir(logsBase)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read logs base dir: %w", err)
+	}
+
+	total := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// 删除整个项目日志目录，后续 SaveLog 会自动重建
+		dir := filepath.Join(logsBase, entry.Name())
+		n, err := countLogFiles(dir)
+		if err != nil {
+			return total, err
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return total, fmt.Errorf("remove logs for %s: %w", entry.Name(), err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func countLogFiles(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // NextBuildID 获取下一个构建编号，原子地递增并持久化
 func (s *Store) NextBuildID(name string) (int, error) {
 	p, err := s.GetProject(name)
