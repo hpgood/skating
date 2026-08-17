@@ -1,0 +1,46 @@
+# ============================================
+# Skating Example: Node.js 项目 CI
+# ============================================
+# 演示前端/Node.js 项目的典型 CI 流水线：
+#   Stage 1: install  - 安装依赖
+#   Stage 2: build    - 编译构建
+#   Stage 3: test     - 运行测试
+# ============================================
+
+name: node-project-example
+image: node:20
+pipeline:
+  stages:
+    - name: install
+      steps:
+        - name: npm-install
+          type: shell
+          script: |
+            echo "=== 安装依赖 ==="
+            npm ci
+            echo "依赖安装完成"
+
+    - name: build
+      steps:
+        - name: npm-build
+          type: shell
+          script: |
+            echo "=== 编译构建 ==="
+            npm run build --if-present
+            echo "构建完成"
+
+    - name: test
+      steps:
+        - name: npm-test
+          type: shell
+          script: |
+            echo "=== 运行测试 ==="
+            npm test --if-present
+            echo "测试完成"
+
+        - name: npm-audit
+          type: shell
+          script: |
+            echo "=== 安全审计 ==="
+            npm audit --production --audit-level=high
+            echo "安全审计完成"

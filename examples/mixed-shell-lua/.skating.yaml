@@ -1,0 +1,45 @@
+# ============================================
+# Skating Example: 混合 Shell + Lua 脚本
+# ============================================
+# 演示在同一个流水线中混合使用 Shell 和 Lua 脚本。
+# Lua 脚本通过 sh() API 调用 shell 命令，
+# 可以方便地进行条件逻辑处理。
+# ============================================
+
+name: mixed-shell-lua-example
+image: golang:1.21
+pipeline:
+  stages:
+    - name: shell-stage
+      steps:
+        - name: info
+          type: shell
+          script: |
+            echo "=== 环境信息 ==="
+            echo "Build ID: ${SKA_BUILD_ID}"
+            echo "Go版本: $(go version)"
+            echo "工作目录: $(pwd)"
+
+    - name: lua-stage
+      steps:
+        - name: lua-build-with-logic
+          type: lua
+          source: scripts/build.lua
+
+        - name: lua-test
+          type: lua
+          source: scripts/test.lua
+
+    - name: shell-verify
+      steps:
+        - name: verify-artifacts
+          type: shell
+          script: |
+            echo "=== 验证构建产物 ==="
+            if [ -f "./myapp" ]; then
+              echo "构建产物存在: ./myapp"
+              ls -la ./myapp
+            else
+              echo "构建产物不存在"
+              exit 1
+            fi

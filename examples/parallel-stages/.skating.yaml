@@ -1,0 +1,58 @@
+# ============================================
+# Skating Example: 并行构建
+# ============================================
+# 演示同一个 Stage 内多个 Step 并行执行。
+# parallel: true 时，Stage 内的所有 Step
+# 会通过 goroutine 并发运行。
+# ============================================
+
+name: parallel-build-example
+image: golang:1.21
+pipeline:
+  stages:
+    - name: sequential-prepare
+      steps:
+        - name: download-deps
+          type: shell
+          script: |
+            echo "=== 下载依赖 ==="
+            go mod download
+            echo "依赖下载完成"
+
+    - name: parallel-checks
+      parallel: true
+      steps:
+        - name: unit-test-pkg1
+          type: shell
+          script: |
+            echo "=== 测试 pkg1 ==="
+            sleep 2
+            echo "pkg1 测试通过"
+
+        - name: unit-test-pkg2
+          type: shell
+          script: |
+            echo "=== 测试 pkg2 ==="
+            sleep 2
+            echo "pkg2 测试通过"
+
+        - name: lint-check
+          type: shell
+          script: |
+            echo "=== 代码检查 ==="
+            sleep 1
+            echo "代码检查通过"
+
+    - name: final-report
+      steps:
+        - name: generate-report
+          type: lua
+          script: |
+            log("=== 生成构建报告 ===")
+            local build_id = os.getenv("SKA_BUILD_ID")
+            if build_id then
+              set_env("REPORT_FILE", "build-" .. build_id .. "-report.txt")
+              log("报告文件: build-" .. build_id .. "-report.txt")
+            else
+              log("警告: SKA_BUILD_ID 未设置")
+            end

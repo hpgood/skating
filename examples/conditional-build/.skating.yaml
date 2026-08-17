@@ -1,0 +1,51 @@
+# ============================================
+# Skating Example: 条件构建
+# ============================================
+# 演示 When 条件判断的使用场景：
+#   - 根据 SKA_BUILD_ID 决定是否执行某步
+#   - 模拟按分支名决定行为
+#   - 条件表达式为空时始终执行
+# ============================================
+
+name: conditional-build-example
+image: golang:1.21
+pipeline:
+  stages:
+    - name: always-run
+      steps:
+        - name: setup
+          type: shell
+          script: |
+            echo "=== 始终执行的步骤 ==="
+            echo "Build #${SKA_BUILD_ID}"
+
+    - name: conditional-stage
+      steps:
+        - name: only-release
+          type: shell
+          when: $SKA_BUILD_ID == 5
+          script: |
+            echo "=== 仅第 5 次构建时执行 ==="
+            echo "这是里程碑构建！"
+
+        - name: after-first-build
+          type: shell
+          when: $SKA_BUILD_ID > 1
+          script: |
+            echo "=== 第 2 次及之后的构建 ==="
+            echo "增量构建模式"
+
+        - name: production-deploy
+          type: shell
+          when: branch == "main"
+          script: |
+            echo "=== 生产环境部署 ==="
+            echo "部署到生产服务器..."
+            echo "注意: 此步骤仅在 main 分支触发"
+
+        - name: always-execute
+          type: lua
+          script: |
+            log("=== 无条件步骤 ===")
+            local build_id = os.getenv("SKA_BUILD_ID")
+            log("当前构建编号: " .. (build_id or "unknown"))

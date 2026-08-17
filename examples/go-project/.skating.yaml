@@ -1,0 +1,54 @@
+# ============================================
+# Skating Example: Go 项目标准 CI
+# ============================================
+# 演示 Go 项目的典型 CI 流水线：
+#   Stage 1: build   - 编译检查
+#   Stage 2: test    - 单元测试 + 竞态检测
+#   Stage 3: lint    - 代码规范检查
+# ============================================
+
+name: go-project-example
+image: golang:1.21
+pipeline:
+  stages:
+    - name: build
+      steps:
+        - name: compile
+          type: shell
+          script: |
+            echo "=== 编译项目 ==="
+            go build ./...
+
+    - name: test
+      steps:
+        - name: unit-test
+          type: shell
+          script: |
+            echo "=== 运行单元测试 ==="
+            go test -v -coverprofile=coverage.out ./...
+
+        - name: race-detector
+          type: shell
+          script: |
+            echo "=== 竞态检测 ==="
+            go test -race -short ./...
+
+    - name: lint
+      steps:
+        - name: gofmt-check
+          type: shell
+          script: |
+            echo "=== 代码格式检查 ==="
+            if [ -n "$(gofmt -l .)" ]; then
+              echo "ERROR: 以下文件格式不正确:"
+              gofmt -l .
+              exit 1
+            fi
+            echo "代码格式检查通过"
+
+        - name: go-vet
+          type: shell
+          script: |
+            echo "=== 静态分析 ==="
+            go vet ./...
+            echo "静态分析通过"
