@@ -1,6 +1,8 @@
 # Skating
 
-A lightweight CI/CD automation tool — Jenkins-like simplicity without the overhead. No database required, single binary deployment.
+[中文说明](README.zh-CN.md)
+
+A lightweight CI/CD automation tool — Jenkins-like power, single binary simplicity. No database, no daemons, no config drift. Built for vibe coding.
 
 ## Features
 
@@ -17,8 +19,16 @@ A lightweight CI/CD automation tool — Jenkins-like simplicity without the over
 # Build from source (requires Go 1.21+)
 git clone https://github.com/hpgood/skating.git
 cd skating
-go build -o skating ./cmd/skating/
+go build -ldflags="-X main.version=0.2.0" -o skating ./cmd/skating/
 
+# Verify
+./skating version
+```
+```
+skating 0.2.0
+  commit : abc123
+  built  : 2024-01-01
+```
 # Or use the install scripts
 # Linux/macOS:
 bash scripts/install.sh
@@ -44,8 +54,11 @@ skating run myproject # Run the build
 | `skating config <project>` | View project configuration |
 | `skating logs <project>` | View build logs (`--last N`, `--id N`) |
 | `skating clean <project>` | Clear build logs (keeps BuildID and registry) |
+| `skating version` | Print version (commit, build date) |
 | `skating skill` | Output SKILL guide for AI agents |
 | `skating ls` | List all registered projects and their status |
+
+All commands support `--lang zh-CN` for Chinese output.
 
 ## Three-Layer Architecture
 

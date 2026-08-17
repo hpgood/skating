@@ -1,6 +1,6 @@
 # Skating
 
-一个轻量级 CI/CD 自动化构建工具，类似 Jenkins 但部署极简 —— 无需大型数据库，开箱即用。
+一个轻量级 CI/CD 自动化构建工具 —— 媲美 Jenkins 的能力，单二进制文件的极简部署。无需数据库、无需守护进程、零配置漂移。为 vibe coding 而生。
 
 ## 特性
 
@@ -17,7 +17,16 @@
 # 从源码编译（需要 Go 1.21+）
 git clone https://github.com/hpgood/skating.git
 cd skating
-go build -o skating ./cmd/skating/
+go build -ldflags="-X main.version=0.2.0" -o skating ./cmd/skating/
+
+# 验证
+./skating version
+```
+```
+skating 0.2.0
+  commit : abc123
+  built  : 2024-01-01
+```
 
 # 或使用安装脚本
 # Linux/macOS:
@@ -44,8 +53,11 @@ skating run myproject # 执行构建
 | `skating config <项目>` | 查看项目配置 |
 | `skating logs <项目>` | 查看构建日志（支持 `--last N`、`--id N`） |
 | `skating clean <项目>` | 清空构建日志（保留 BuildID 和项目注册信息） |
+| `skating version` | 输出版本号（含 commit 和构建日期） |
 | `skating skill` | 输出 SKILL 指南（供 AI 智能体使用） |
 | `skating ls` | 列出所有已注册项目及构建状态 |
+
+所有命令默认输出英文，可通过 `--lang zh-CN` 切换为中文。示例：`skating run myproject --lang zh-CN`
 
 ## 三层架构
 
