@@ -11,6 +11,19 @@ A lightweight CI/CD automation tool — Jenkins-like power, single binary simpli
 - **Docker sandbox** — Isolated builds inside containers for consistent environments
 - **Cross-platform** — Windows / Linux / macOS
 
+## vs Drone
+
+| | Skating | Drone |
+|---|---------|-------|
+| **部署** | 单二进制，`go install` 即用 | 需要 Server + Runner + 数据库 |
+| **数据库** | 无，本地 YAML 文件 | PostgreSQL / MySQL / SQLite |
+| **配置** | 单文件 `.skating.yaml`，在项目内 | `.drone.yml` + Web UI 配置 |
+| **执行层** | Shell + Lua (Gopher-Lua 沙箱) | 纯 Shell / 插件 |
+| **插件** | Yaegi Go 解释器，原生性能 | Docker 容器化插件 |
+| **并行** | Stage 级别原生 goroutine | 多 Runner / 多 Pipeline |
+| **缓存** | 无外部依赖 | 需 Redis 或共享卷 |
+| **安装成本** | < 30 秒 | 需 Docker Compose / K8s 部署 |
+
 ## Quick Start
 
 ### Installation
