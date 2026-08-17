@@ -1,0 +1,2 @@
+# skating
+fast CICD build
