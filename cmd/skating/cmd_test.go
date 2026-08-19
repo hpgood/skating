@@ -781,3 +781,84 @@ pipeline:
 		t.Errorf("error should list known stages (containing 'build'): %q", stderr)
 	}
 }
+
+// TestRun_StepFilterFailingStepReturnsError 是 Bug 回归测试：
+// `--step stage/step` 模式下，被选的 step 失败时 RunPipeline 必须返回非 nil error，
+// 让 cmd_run 报 "Build FAILED" 而不是误报 SUCCESS。
+//
+// 之前实现里 filter 模式下 `continue` 直接吞掉 err，导致 exit code 0 + "Build SUCCESS"，
+// 看似 build 成功实际失败——测试 / CI 会漏报。
+func TestRun_StepFilterFailingStepReturnsError(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "failingstep")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	// 3 stages: skip / target (exit 1) / skip
+	// --step target/will-fail → 只跑 target/will-fail，其他都 skipped
+	// 期望: stderr 含 EXEC ERROR + "Build FAILED"（不是 Build SUCCESS）
+	yamlContent := `name: failingstep
+pipeline:
+  stages:
+    - name: before
+      steps:
+        - name: a
+          type: shell
+          script: |
+            echo "A-RAN"
+            exit 1
+    - name: target
+      steps:
+        - name: will-fail
+          type: shell
+          script: |
+            echo "WILL-FAIL"
+            exit 1
+    - name: after
+      steps:
+        - name: c
+          type: shell
+          script: |
+            echo "C-RAN"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "failingstep", "--step", "target/will-fail")
+	combined := stdout + stderr
+
+	// 关键断言 1: 失败 step 真的跑了（WILL-FAIL 出现）
+	if !strings.Contains(combined, "WILL-FAIL") {
+		t.Errorf("step 'will-fail' should have run (no WILL-FAIL in output): %q", combined)
+	}
+
+	// 关键断言 2: EXEC ERROR marker 出现（说明 RunPipeline 返回了非 nil err，
+	// cmd_run 把它当 stderr 抛了；如果被吞掉，会看到 "Build SUCCESS" 而非 EXEC ERROR）
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Errorf("filter mode failed step must surface EXEC ERROR (RunPipeline returned nil err?), got stderr=%q", stderr)
+	}
+
+	// 关键断言 3: 不能是 Build SUCCESS（应该是 FAILED）
+	if strings.Contains(combined, "=== Build SUCCESS ===") {
+		t.Errorf("filter mode step failure must NOT report Build SUCCESS: %q", combined)
+	}
+	if !strings.Contains(combined, "Build FAILED") {
+		t.Errorf("expected 'Build FAILED' marker in output, got: %q", combined)
+	}
+
+	// 关键断言 4: skipped 阶段在 summary 里出现（filter 模式让 summary 完整）
+	if !strings.Contains(combined, "[before/a] skipped") {
+		t.Errorf("expected [before/a] skipped marker: %q", combined)
+	}
+	if !strings.Contains(combined, "[after/c] skipped") {
+		t.Errorf("expected [after/c] skipped marker: %q", combined)
+	}
+}

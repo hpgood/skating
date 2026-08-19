@@ -35,6 +35,7 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 		opts = &RunOptions{}
 	}
 	var results []*PipelineResult
+	var firstErr error
 
 	for _, stage := range p.Stages {
 		// 阶段级过滤：如果指定了 stage，跳过其他 stage 但记录 skipped 结果
@@ -60,13 +61,18 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 			// 让用户看到"哪些 stage 因为 filter 没跑到"。
 			// 默认模式（opts 为零值）：保留原"遇错即停"语义。
 			if opts.StageName != "" || opts.StepName != "" {
+				// 不立刻 return —— 继续遍历，让后续 stage 至少以 skipped 形式记录。
+				// 但要保留 firstErr 让循环结束后返回给调用方（不能让 cmd_run 误以为成功）。
+			if firstErr == nil {
+					firstErr = err
+				}
 				continue
 			}
 			return results, err
 		}
 	}
 
-	return results, nil
+	return results, firstErr
 }
 
 func runStage(stage Stage, exec Executor, env map[string]string, logFn func(string), opts *RunOptions) ([]*PipelineResult, error) {
