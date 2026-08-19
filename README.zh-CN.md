@@ -72,6 +72,53 @@ skating run myproject # 执行构建
 
 所有命令默认输出英文，可通过 `--lang zh-CN` 切换为中文。示例：`skating run myproject --lang zh-CN`
 
+### `skating run` 选项
+
+`run` 命令支持两个 flag 用于选择性子集 / 参数化构建：
+
+| Flag | 格式 | 说明 |
+|---|---|---|
+| `--step` | `<stage>` 或 `<stage>/<step>` | 只跑指定 stage（或单个 step）。其他 stage 和同 stage 内其他 step 在 summary 里以 `skipped` 显示，但不会执行。 |
+| `--env`  | `KEY=VAL`（可重复） | 注入自定义环境变量到本次运行的每个 step。用户传入值**优先级高于**内置 `SKA_BUILD_*` 变量。 |
+
+#### 用 `--step` 选择性执行
+
+```bash
+# 只跑 build 整个 stage（sequential step 失败仍跑完整个 stage）
+skating run myproj --step build
+
+# 只跑 build stage 里的 compile 单个 step
+skating run myproj --step build/compile
+
+# 未知 stage → 报错并给出 stage 名单
+$ skating run myproj --step nonexistent
+ERROR: --step "nonexistent" 中 stage "nonexistent" 不存在。已知 stage: [build test deploy]
+```
+
+行为说明：
+- 没选中的 stage 在 summary 里以 `○ skipped` 显示 —— 用户始终看得到哪些 stage 没跑到。
+- `--step build`（整 stage）模式下，sequential step 失败**继续**跑后续 step，让用户看到完整 stage 全貌。
+- `--step build/compile`（单个 step）保留原"遇错即停"语义。
+- 多 stage 顺序：选中的 stage 失败时，后续 stage 仍记为 `skipped`（不会悄悄漏掉），summary 完整。
+
+#### 用 `--env` 注入自定义环境变量
+
+```bash
+# 注入单个变量
+skating run myproj --env DEPLOY_ENV=staging
+
+# 多个值；同名变量后者覆盖前者
+skating run myproj --env DEPLOY_ENV=staging --env REGION=us-west-2
+
+# 覆盖内置 SKA_BUILD_*（如用于重放/调试）
+skating run myproj --env SKA_BUILD_ID=999
+
+# 两个 flag 组合：只跑 release step 并指定自定义目标
+skating run myproj --step deploy/release --env DEPLOY_TARGET=canary
+```
+
+`--env` 格式错误（缺 `=`、KEY 为空）会在任何 step 执行前明确报错。
+
 ## 三层架构
 
 ```

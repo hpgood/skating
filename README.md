@@ -73,6 +73,53 @@ skating run myproject # Run the build
 
 All commands support `--lang zh-CN` for Chinese output.
 
+### `skating run` options
+
+The `run` command supports two flags for selective / parameterized builds:
+
+| Flag | Format | Description |
+|---|---|---|
+| `--step`  | `<stage>` or `<stage>/<step>` | Run only the named stage (or single step). Other stages / same-stage siblings are reported as `skipped` in the summary but never execute. |
+| `--env`   | `KEY=VAL` (repeatable) | Inject a custom environment variable into every step of this run. User values **override** the built-in `SKA_BUILD_*` variables. |
+
+#### Selective execution with `--step`
+
+```bash
+# Run only the 'build' stage (sequential steps inside run end-to-end, even on failure)
+skating run myproj --step build
+
+# Run only one step inside a stage; other stages & sibling steps are skipped
+skating run myproj --step build/compile
+
+# Unknown stage → clear error listing known stages
+$ skating run myproj --step nonexistent
+ERROR: stage "nonexistent" in --step "nonexistent" not found. Known stages: [build test deploy]
+```
+
+Behavior notes:
+- Stages not selected are reported with `○ skipped` in the build summary — you always see what was *not* run.
+- Within a filtered stage (`--step build`), sequential steps continue past failures so you get a full picture of the stage.
+- Step-level filters (`--step build/compile`) preserve the original "stop on first failure" semantic.
+- Multi-stage failure ordering: if the selected stage fails, subsequent stages are still marked `skipped` (not silently dropped) so the summary is complete.
+
+#### Custom env vars with `--env`
+
+```bash
+# Inject a single var
+skating run myproj --env DEPLOY_ENV=staging
+
+# Multiple values; later wins on duplicates
+skating run myproj --env DEPLOY_ENV=staging --env REGION=us-west-2
+
+# Override a built-in SKA_BUILD_* var (e.g. for replay/debug)
+skating run myproj --env SKA_BUILD_ID=999
+
+# Both flags together: deploy only the 'release' step with a custom target
+skating run myproj --step deploy/release --env DEPLOY_TARGET=canary
+```
+
+Malformed `--env` values (missing `=`, empty KEY) produce a clear error before any step runs.
+
 ## Three-Layer Architecture
 
 ```
