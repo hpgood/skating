@@ -62,11 +62,9 @@ func runRun(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// 4. 准备环境变量
-	// 注意: SK_BUILD_TIMESTAMP 是用户指定的命名, 与历史变量 SKA_BUILD_ID 前缀不一致
-	// 如果未来想统一为 SKA_ 前缀, 请同步改 cmd_run.go + 文档 + 现有 yaml
 	env := map[string]string{
 		"SKA_BUILD_ID":        fmt.Sprintf("%d", buildID),
-		"SK_BUILD_TIMESTAMP":  startTime.Format(time.RFC3339),
+		"SKA_BUILD_TIMESTAMP": startTime.Format(time.RFC3339),
 	}
 
 	// 日志收集：同时输出到终端和缓冲区
