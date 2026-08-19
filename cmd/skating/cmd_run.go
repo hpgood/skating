@@ -62,9 +62,13 @@ func runRun(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// 4. 准备环境变量
+	// SKA_BUILD_TIMESTAMP: 整数 unix 秒 (UTC, 自 epoch 起). 用于排序/diff/算耗时
+	// SKA_BUILD_DATE:      RFC3339 字符串 (UTC), 人类可读日期
+	// 用户脚本需要本地时区可基于 SKA_BUILD_TIMESTAMP 自行换算
 	env := map[string]string{
 		"SKA_BUILD_ID":        fmt.Sprintf("%d", buildID),
-		"SKA_BUILD_TIMESTAMP": startTime.Format(time.RFC3339),
+		"SKA_BUILD_TIMESTAMP": fmt.Sprintf("%d", startTime.Unix()),
+		"SKA_BUILD_DATE":      startTime.UTC().Format(time.RFC3339),
 	}
 
 	// 日志收集：同时输出到终端和缓冲区
