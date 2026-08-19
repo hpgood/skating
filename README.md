@@ -115,8 +115,8 @@ pipeline:
         - name: release
           type: lua             # Lua script execution
           script: |
-            log("Build: " .. os.getenv("SKA_BUILD_ID"))
-            sh("docker push myapp:" .. os.getenv("SKA_BUILD_ID"))
+            log("Build: " .. getenv("SKA_BUILD_ID"))
+            sh("docker push myapp:" .. getenv("SKA_BUILD_ID"))
         - name: notify
           type: shell
           when: branch == "main"  # Conditional execution
@@ -126,10 +126,26 @@ pipeline:
 
 ## Environment Variables
 
-Every build automatically injects `SKA_BUILD_ID` (auto-incrementing from 1):
+Every build automatically injects these environment variables (UTC, derived from build start time):
 
+| Variable | Type | Example | Description |
+|---|---|---|---|
+| `SKA_BUILD_ID`        | integer (string) | `1`           | Auto-incrementing build number (from 1) |
+| `SKA_BUILD_TIMESTAMP` | integer (string) | `1787139682`  | Build start time as **Unix seconds (UTC)** — easy to sort / diff / arithmetic |
+| `SKA_BUILD_DATE`      | string           | `2026-08-19T11:41:22Z` | Build start time as **RFC3339 (UTC)** — human-readable, for reports/logs |
+
+Shell scripts:
 ```bash
-echo "Building version ${SKA_BUILD_ID}"
+echo "Building version ${SKA_BUILD_ID} at ${SKA_BUILD_DATE}"
+echo "Local time: $(date -d @${SKA_BUILD_TIMESTAMP})"
+```
+
+Lua scripts (sandbox has no `os` module — use `getenv`):
+```lua
+log("Build: " .. getenv("SKA_BUILD_ID"))
+sh("docker push myapp:" .. getenv("SKA_BUILD_ID"))
+local ts = getenv("SKA_BUILD_TIMESTAMP")
+log("Unix seconds: " .. ts)
 ```
 
 ## Data Storage

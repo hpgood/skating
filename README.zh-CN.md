@@ -114,8 +114,8 @@ pipeline:
         - name: release
           type: lua             # Lua 脚本执行
           script: |
-            log("Build: " .. os.getenv("SKA_BUILD_ID"))
-            sh("docker push myapp:" .. os.getenv("SKA_BUILD_ID"))
+            log("Build: " .. getenv("SKA_BUILD_ID"))
+            sh("docker push myapp:" .. getenv("SKA_BUILD_ID"))
         - name: notify
           type: shell
           when: branch == "main"  # 条件执行
@@ -125,10 +125,26 @@ pipeline:
 
 ## 环境变量
 
-每次构建自动注入 `SKA_BUILD_ID`（从 1 开始递增），脚本中可直接使用：
+每次构建自动注入以下环境变量（基于构建开始时间，UTC 时区）：
 
+| 变量 | 类型 | 示例 | 说明 |
+|---|---|---|---|
+| `SKA_BUILD_ID`        | 整数（字符串） | `1`           | 自增构建编号（从 1 起） |
+| `SKA_BUILD_TIMESTAMP` | 整数（字符串） | `1787139682`  | 构建开始时间的 **Unix 秒（UTC）**——便于排序 / 算 diff / 数值比较 |
+| `SKA_BUILD_DATE`      | 字符串         | `2026-08-19T11:41:22Z` | 构建开始时间的 **RFC3339（UTC）**——人类可读，用于报告 / 日志 |
+
+Shell 脚本用法：
 ```bash
-echo "Building version ${SKA_BUILD_ID}"
+echo "Building version ${SKA_BUILD_ID} at ${SKA_BUILD_DATE}"
+echo "Local time: $(date -d @${SKA_BUILD_TIMESTAMP})"
+```
+
+Lua 脚本用法（沙箱没有 `os` 模块，需用 `getenv`）：
+```lua
+log("Build: " .. getenv("SKA_BUILD_ID"))
+sh("docker push myapp:" .. getenv("SKA_BUILD_ID"))
+local ts = getenv("SKA_BUILD_TIMESTAMP")
+log("Unix seconds: " .. ts)
 ```
 
 ## 数据存储
