@@ -87,6 +87,8 @@ func executeCmd(t *testing.T, args ...string) (stdout, stderr string) {
 	logLast = 0
 	logID = 0
 	initForce = false
+	runStep = ""
+	runUserEnv = nil
 	// Reset parsed-flag state so subsequent Flag().Parse() doesn't think flags
 	// are already set.
 	target.Flags().VisitAll(func(pf *pflag.Flag) { pf.Changed = false })
@@ -529,5 +531,253 @@ pipeline:
 	if roundtripStr != "" && roundtripStr != dateStr {
 		t.Errorf("SKA_BUILD_TIMESTAMP (unix %s) converted back via 'date -u -d @...' = %q, but SKA_BUILD_DATE = %q (should be equal)",
 			tsStr, roundtripStr, dateStr)
+	}
+}
+
+// TestRun_StepFilterSingleStep 验证 --step stage/step 只运行指定单个 step，
+// 其他 stage 和同 stage 内其他 step 都记为 skipped。
+//
+// Pipeline 设计（避免 host shell 干扰，shell step 一律 exit 0 让 stdout 进 stderr）：
+//   stage-pre:   step-pre-only
+//   stage-build: step-keep (被选中的, exit 1), step-skip (同 stage, exit 0)
+//   stage-post:  step-post-only
+//
+// 预期: step-pre-only / step-skip / step-post-only 都在 results 里 status=skipped;
+// step-keep 是 status=failed (因为 exit 1) 且 stdout 含 "KEEP-RAN"。
+func TestRun_StepFilterSingleStep(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "stepfilter")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	yamlContent := `name: stepfilter
+pipeline:
+  stages:
+    - name: pre
+      steps:
+        - name: pre-only
+          type: shell
+          script: |
+            echo "PRE-RAN"
+            exit 1
+    - name: build
+      steps:
+        - name: keep
+          type: shell
+          script: |
+            echo "KEEP-RAN"
+            exit 1
+        - name: skip
+          type: shell
+          script: |
+            echo "SKIP-RAN"
+            exit 1
+    - name: post
+      steps:
+        - name: post-only
+          type: shell
+          script: |
+            echo "POST-RAN"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	// --step build/keep → 只跑 build/keep，其余三个都被记为 skipped
+	stdout, stderr := executeCmd(t, "run", "stepfilter", "--step", "build/keep")
+	combined := stdout + stderr
+
+	// step-keep 应该真的跑了（exit 1 → EXEC ERROR），stdout 含 KEEP-RAN
+	if !strings.Contains(combined, "KEEP-RAN") {
+		t.Errorf("step 'keep' did not run (no KEEP-RAN in output): %q", combined)
+	}
+
+	// 其他三个 step 应该被 skip（runner 通过 logFn 输出 "[stage/step] skipped (...)"）
+	for _, skipped := range []string{"pre/pre-only", "build/skip", "post/post-only"} {
+		pattern := fmt.Sprintf("[%s] skipped", skipped)
+		if !strings.Contains(combined, pattern) {
+			t.Errorf("expected %q to be skipped, not found in output: %q", pattern, combined)
+		}
+	}
+
+	// 反向断言：pre/POST/skip 不应该真的跑（echo 输出在 error message 里）
+	// 注意：echo 输出仍可能出现在 EXEC ERROR message 之外的某处，所以用 "X-RAN" 直接匹配
+	if strings.Contains(combined, "PRE-RAN") {
+		t.Errorf("stage 'pre' should have been skipped, but PRE-RAN appeared: %q", combined)
+	}
+	if strings.Contains(combined, "POST-RAN") {
+		t.Errorf("stage 'post' should have been skipped, but POST-RAN appeared: %q", combined)
+	}
+	if strings.Contains(combined, "SKIP-RAN") {
+		t.Errorf("step 'skip' (same stage as 'keep') should have been skipped, but SKIP-RAN appeared: %q", combined)
+	}
+}
+
+// TestRun_StepFilterSingleStage 验证 --step stage (不带 /step) 跑整个 stage。
+// 其他 stage 记为 skipped；同 stage 内所有 step 都跑。
+//
+// 设计:
+//   stage-build: step-a (exit 0), step-b (exit 0)
+//   stage-other: step-x (exit 0)
+//
+// 预期: step-a / step-b 都真的跑（"A-RAN" "B-RAN" 出现），step-x 被 skipped。
+func TestRun_StepFilterSingleStage(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "stagefilter")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	yamlContent := `name: stagefilter
+pipeline:
+  stages:
+    - name: build
+      steps:
+        - name: a
+          type: shell
+          script: |
+            echo "A-RAN"
+            exit 1
+        - name: b
+          type: shell
+          script: |
+            echo "B-RAN"
+            exit 1
+    - name: other
+      steps:
+        - name: x
+          type: shell
+          script: |
+            echo "X-RAN"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "stagefilter", "--step", "build")
+	combined := stdout + stderr
+
+	if !strings.Contains(combined, "A-RAN") {
+		t.Errorf("stage 'build' step 'a' should have run: %q", combined)
+	}
+	if !strings.Contains(combined, "B-RAN") {
+		t.Errorf("stage 'build' step 'b' should have run: %q", combined)
+	}
+	if strings.Contains(combined, "X-RAN") {
+		t.Errorf("stage 'other' should have been skipped, but X-RAN appeared: %q", combined)
+	}
+	if !strings.Contains(combined, "[other/x] skipped") {
+		t.Errorf("expected [other/x] skipped marker, not found in: %q", combined)
+	}
+}
+
+// TestRun_EnvOverride 验证 -e KEY=VAL 把环境变量注入到 step，
+// 且用户传入的 env 优先级高于 SKA_ 系统 env（用户显式覆盖）。
+//
+// 设计:
+//   - shell step 把 SKA_BUILD_ID / USER_FOO / USER_OVERRIDE 三个 env 都 echo 出来然后 exit 1
+//   - -e USER_FOO=hello -e USER_OVERRIDE=my-value -e SKA_BUILD_ID=999
+//   - 验证 USER_FOO / USER_OVERRIDE 被注入
+//   - 验证 SKA_BUILD_ID 被用户值 999 覆盖（而不是系统默认的 1）
+func TestRun_EnvOverride(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "envtest2")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	yamlContent := `name: envtest2
+pipeline:
+  stages:
+    - name: probe
+      steps:
+        - name: dump-env
+          type: shell
+          script: |
+            echo "SKA_BUILD_ID=${SKA_BUILD_ID}"
+            echo "USER_FOO=${USER_FOO}"
+            echo "USER_OVERRIDE=${USER_OVERRIDE}"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "envtest2",
+		"--env", "USER_FOO=hello",
+		"--env", "USER_OVERRIDE=my-value",
+		"--env", "SKA_BUILD_ID=999",
+	)
+	combined := stdout + stderr
+
+	// 用户值被注入
+	if !strings.Contains(combined, "USER_FOO=hello") {
+		t.Errorf("USER_FOO=hello not injected, output: %q", combined)
+	}
+	if !strings.Contains(combined, "USER_OVERRIDE=my-value") {
+		t.Errorf("USER_OVERRIDE=my-value not injected, output: %q", combined)
+	}
+
+	// 用户值覆盖 SKA_BUILD_ID 默认值 1
+	if !strings.Contains(combined, "SKA_BUILD_ID=999") {
+		t.Errorf("user --env should override SKA_BUILD_ID (expected =999), output: %q", combined)
+	}
+	if strings.Contains(combined, "SKA_BUILD_ID=1\n") || strings.Contains(combined, "SKA_BUILD_ID=1 ") {
+		t.Errorf("SKA_BUILD_ID should be overridden to 999, but default 1 leaked: %q", combined)
+	}
+}
+
+// TestRun_StepFilterUnknownStage 验证 --step 不存在的 stage 时给出清晰的错误。
+func TestRun_StepFilterUnknownStage(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "badfilter")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	yamlContent := `name: badfilter
+pipeline:
+  stages:
+    - name: build
+      steps:
+        - name: compile
+          type: shell
+          script: |
+            echo "should not run"
+            exit 0
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	_, stderr := executeCmd(t, "run", "badfilter", "--step", "nonexistent")
+	if !strings.Contains(stderr, "nonexistent") {
+		t.Errorf("error should mention missing stage name 'nonexistent': %q", stderr)
+	}
+	if !strings.Contains(stderr, "build") {
+		t.Errorf("error should list known stages (containing 'build'): %q", stderr)
 	}
 }

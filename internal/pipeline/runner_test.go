@@ -73,7 +73,7 @@ func TestRunPipeline_SerialStage_StopsOnFailure(t *testing.T) {
 		},
 	}
 
-	results, err := RunPipeline(p, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {})
+	results, err := RunPipeline(p, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {}, nil)
 	if err == nil {
 		t.Fatal("expected error from failed step")
 	}
@@ -113,7 +113,7 @@ func TestRunPipeline_ParallelStage_RunsConcurrently(t *testing.T) {
 		},
 	}
 
-	_, err := RunPipeline(p, exec, nil, func(s string) {})
+	_, err := RunPipeline(p, exec, nil, func(s string) {}, nil)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestRunPipeline_MultiStage_StopsAfterFailedStage(t *testing.T) {
 		},
 	}
 
-	_, err := RunPipeline(p, exec, nil, func(s string) {})
+	_, err := RunPipeline(p, exec, nil, func(s string) {}, nil)
 	if err == nil {
 		t.Fatal("expected error from s1 failure")
 	}
@@ -206,7 +206,7 @@ func TestRunPipeline_AllSuccess(t *testing.T) {
 		},
 	}
 
-	results, err := RunPipeline(p, exec, nil, func(s string) {})
+	results, err := RunPipeline(p, exec, nil, func(s string) {}, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
