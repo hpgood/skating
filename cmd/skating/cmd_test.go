@@ -21,8 +21,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hpgood/skating/internal/store"
 	"github.com/spf13/pflag"
@@ -416,5 +418,116 @@ func TestRun_UnknownProject(t *testing.T) {
 	_, stderr := executeCmd(t, "run", "nope")
 	if !strings.Contains(stderr, "nope") || !strings.Contains(stderr, "不存在") && !strings.Contains(stderr, "not found") {
 		t.Errorf("expected project-not-found error mentioning 'nope': %q", stderr)
+	}
+}
+
+// TestRun_InjectedBuildEnvVars 验证 cmd_run 注入的三个 build-time env
+// (SKA_BUILD_ID / SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE) 都能从 step 里读到,
+// 且格式/一致性正确:
+//   - SKA_BUILD_TIMESTAMP 是 10 位整数 unix 秒 (UTC)
+//   - SKA_BUILD_DATE     是 RFC3339 字符串以 'Z' 结尾 (UTC)
+//   - 转 SKA_BUILD_TIMESTAMP 回 UTC 日期 ≈ SKA_BUILD_DATE (一致性)
+//
+// 注意 runShell 把脚本 stdout 写到自己的 bytes.Buffer, 不会通过 logFn 转发,
+// 所以这里用 exit 1 让 executor 失败, 把 stdout 拼到 error message 里显示出来
+// (cmd_run 的 logFn 只看到 [stage/step] FAILED 这行; stdout 内容通过 stderr 冒上来).
+func TestRun_InjectedBuildEnvVars(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "envtest")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	// 一个 shell step: echo 三个 env 的值, 然后 exit 1 让 stdout 走到 stderr.
+	yamlContent := `name: envtest
+pipeline:
+  stages:
+    - name: probe
+      steps:
+        - name: dump-env
+          type: shell
+          script: |
+            echo "SKA_BUILD_ID=${SKA_BUILD_ID}"
+            echo "SKA_BUILD_TIMESTAMP=${SKA_BUILD_TIMESTAMP}"
+            echo "SKA_BUILD_DATE=${SKA_BUILD_DATE}"
+            echo "ROUNDTRIP=$(date -u -d @${SKA_BUILD_TIMESTAMP} +%Y-%m-%dT%H:%M:%SZ)"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "envtest")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR (we forced exit 1), got stderr=%q", stderr)
+	}
+
+	combined := stdout + stderr
+
+	// 1. SKA_BUILD_ID must be present (number string)
+	if !strings.Contains(combined, "SKA_BUILD_ID=1") {
+		t.Errorf("missing SKA_BUILD_ID=1 in output: %q", combined)
+	}
+
+	// 2. SKA_BUILD_TIMESTAMP must be exactly 10-digit unix seconds
+	var tsStr string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "SKA_BUILD_TIMESTAMP=") {
+			tsStr = strings.TrimPrefix(line, "SKA_BUILD_TIMESTAMP=")
+		}
+	}
+	if tsStr == "" {
+		t.Fatalf("SKA_BUILD_TIMESTAMP not found in output")
+	}
+	if len(tsStr) != 10 {
+		t.Errorf("SKA_BUILD_TIMESTAMP = %q, want 10-digit unix seconds (got %d chars)", tsStr, len(tsStr))
+	}
+	if _, err := strconv.Atoi(tsStr); err != nil {
+		t.Errorf("SKA_BUILD_TIMESTAMP = %q is not a pure integer: %v", tsStr, err)
+	}
+	// Sanity range: must be after 2020-01-01 (1577836800) and before 2100-01-01 (4102444800)
+	ts, _ := strconv.Atoi(tsStr)
+	if ts < 1577836800 || ts > 4102444800 {
+		t.Errorf("SKA_BUILD_TIMESTAMP = %d out of sane range [2020..2100]", ts)
+	}
+
+	// 3. SKA_BUILD_DATE must be RFC3339 UTC ending with 'Z'
+	var dateStr string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "SKA_BUILD_DATE=") {
+			dateStr = strings.TrimPrefix(line, "SKA_BUILD_DATE=")
+		}
+	}
+	if dateStr == "" {
+		t.Fatalf("SKA_BUILD_DATE not found in output")
+	}
+	if !strings.HasSuffix(dateStr, "Z") {
+		t.Errorf("SKA_BUILD_DATE = %q, want RFC3339 UTC ending in 'Z'", dateStr)
+	}
+	if _, err := time.Parse(time.RFC3339, dateStr); err != nil {
+		t.Errorf("SKA_BUILD_DATE = %q not valid RFC3339: %v", dateStr, err)
+	}
+
+	// 4. Consistency: date converted back from SKA_BUILD_TIMESTAMP (UTC) must match SKA_BUILD_DATE
+	// The step's "ROUNDTRIP=..." line is what `date -u -d @$TS +...` produced in the container.
+	// (We don't compare against host timezones — the container is UTC.)
+	if !strings.Contains(combined, "ROUNDTRIP=") {
+		t.Errorf("ROUNDTRIP line missing — cannot verify TS/DATE consistency: %q", combined)
+	}
+	// Find ROUNDTRIP line and SKA_BUILD_DATE line, compare
+	var roundtripStr string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "ROUNDTRIP=") {
+			roundtripStr = strings.TrimPrefix(line, "ROUNDTRIP=")
+		}
+	}
+	if roundtripStr != "" && roundtripStr != dateStr {
+		t.Errorf("SKA_BUILD_TIMESTAMP (unix %s) converted back via 'date -u -d @...' = %q, but SKA_BUILD_DATE = %q (should be equal)",
+			tsStr, roundtripStr, dateStr)
 	}
 }
