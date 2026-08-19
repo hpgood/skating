@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/hpgood/skating/internal/i18n"
 	"github.com/hpgood/skating/internal/store"
@@ -67,14 +68,8 @@ func runLogs(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				continue
 			}
-			status := "-"
-			for _, line := range splitLines(info) {
-				if line == "" {
-					continue
-				}
-				status = line
-				break
-			}
+			// 从日志末尾查找 "=== Build SUCCESS ===" 或 "=== Build FAILED ===" marker
+			status := extractBuildStatus(info)
 			fmt.Printf(i18n.T("构建ID: %d  状态: %s\n", "Build ID: %d  Status: %s\n"), buildID, status)
 			fmt.Println("---")
 		}
@@ -104,4 +99,17 @@ func splitLines(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
+}
+
+// extractBuildStatus 从日志文本中提取构建状态。
+// 日志由 cmd_run.go 写入，包含 "=== Build SUCCESS ===" 或 "=== Build FAILED ===" marker。
+// 返回 "success"、"failure" 或 "-"（未找到 marker）。
+func extractBuildStatus(logText string) string {
+	if strings.Contains(logText, "=== Build SUCCESS ===") {
+		return "success"
+	}
+	if strings.Contains(logText, "=== Build FAILED ===") {
+		return "failure"
+	}
+	return "-"
 }

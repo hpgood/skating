@@ -52,7 +52,7 @@ func runClean(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(args) == 0 {
-		return fmt.Errorf(i18n.T("请指定项目名或使用 --all 清空所有日志", "specify a project name or use --all to clean all logs"))
+		return fmt.Errorf("%s", i18n.T("请指定项目名或使用 --all 清空所有日志", "specify a project name or use --all to clean all logs"))
 	}
 
 	projName := args[0]

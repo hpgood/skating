@@ -26,17 +26,19 @@ const skillDocEn = `# SKATING SKILL
 
 ## Overview
 Skating is a lightweight CI/CD automation tool. It uses a YAML-based pipeline DSL
-with Shell and Lua executors, runs builds in Docker containers, and stores all data
-as local YAML files (no database required).
+with Shell and Lua executors, and stores all data as local YAML files (no database required).
+When a docker image is configured and docker CLI is available on the host, shell steps
+run inside a one-shot "docker run --rm" container (workdir mounted, env injected).
+Otherwise shell steps fall back to running directly on the host shell.
 
 ## Commands
 
 ### skating init
 Initialize a skating project in the current directory.
-- Creates .skating.yaml (pipeline config template)
+- Creates .skating.yaml (pipeline config template, schema: pipeline.stages[].steps[])
 - Creates scripts/ directory with example shell/lua scripts
 - Registers the project in global ~/.skating/projects.yaml
-- If .skating.yaml already exists, shows a message; use --force to overwrite
+- If .skating.yaml already exists, returns an error; use --force to overwrite
 - The project name is auto-derived from the current directory name
 - Image defaults to "golang:1.21"
 
@@ -141,8 +143,10 @@ Set an environment variable in the build context.
 set_env("CUSTOM_VAR", "value")
 ` + "```" + `
 
-### upload_artifact(path) [NOT YET IMPLEMENTED]
-Placeholder for artifact upload functionality.
+### upload_artifact(path) -> (dest_path, error)
+Copy a local file to ~/.skating/artifacts/<docker-image-or-host>/<basename>.
+Returns the destination absolute path on success, or empty string + error message on failure.
+` + "`" + `path` + "`" + ` may be an absolute path or relative to the current step's working directory.
 
 ### Lua Sandbox
 - The os and io modules are disabled in the Lua VM
@@ -154,7 +158,12 @@ Condition expressions support the following operators: ==, !=, >, <, >=, <=
 
 Variable resolution:
 - $VAR_NAME: resolved from environment variables (e.g., $SKA_BUILD_ID)
-- bare_identifier: resolved from context variables (e.g., branch)
+- bare_identifier: resolved from auto-detected git context (branch, commit, git_dirty)
+
+Auto-detected git context (available to bare identifiers):
+- branch:   current git branch name (git rev-parse --abbrev-ref HEAD)
+- commit:   short commit hash (git rev-parse --short HEAD)
+- git_dirty: "true" if working tree has uncommitted changes, "false" otherwise
 
 If both sides can be parsed as numbers, numeric comparison is used; otherwise string comparison.
 
@@ -162,6 +171,7 @@ Examples:
 - SKA_BUILD_ID == 5          (only on 5th build)
 - SKA_BUILD_ID > 1           (after first build)
 - branch == "main"           (only on main branch)
+- git_dirty == "false"       (only on clean tree)
 - "" (empty string)          (always run, no condition)
 
 ## Environment Variables
@@ -188,7 +198,30 @@ projects:
 ## Plugins (Yaegi)
 - Builtin ConsoleNotifier prints build result summary after each build
 - User plugins: Go files in plugins/ directory, loaded at startup via Yaegi interpreter
-- Plugin interface: Name(), Version(), Init(), Run(ctx) methods
+- Plugin interface methods: Name(), Version(), Init() (optional), Run(ctx)
+
+### Plugin File Format
+A plugin file MUST declare "package plug" and export a variable named "Plugin" whose
+type implements the plugin interface. Yaegi introspects this single symbol.
+` + "```go" + `
+// File: plugins/notify_slack.go
+package plug
+
+type SlackPlugin struct{}
+
+func (p *SlackPlugin) Name() string    { return "slack" }
+func (p *SlackPlugin) Version() string { return "1.0.0" }
+func (p *SlackPlugin) Init() error     { return nil }
+
+// ctx fields: ProjectName, BuildID, Status ("success"/"failure"), Duration, Output (full log)
+func (p *SlackPlugin) Run(projectName string, buildID int, status string, duration string, output string) error {
+    // post to webhook...
+    return nil
+}
+
+// Yaegi looks up this exact symbol.
+var Plugin = &SlackPlugin{}
+` + "```" + `
 
 ## Examples
 See examples/ directory for complete project templates:
@@ -211,16 +244,19 @@ const skillDocZhCN = `# SKATING SKILL（中文）
 
 ## 概述
 Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水线 DSL，
-配合 Shell 和 Lua 执行器，在 Docker 容器中运行构建，所有数据以本地 YAML 文件存储（无需数据库）。
+配合 Shell 和 Lua 执行器，所有数据以本地 YAML 文件存储（无需数据库）。
+当 .skating.yaml 配置了 docker 镜像且主机上存在 docker CLI 时，shell 步骤
+会在一次性 "docker run --rm" 容器内运行（挂载工作目录、注入环境变量）；
+否则回退到直接在 host shell 执行。
 
 ## 命令
 
 ### skating init
 在当前目录初始化一个 skating 项目。
-- 创建 .skating.yaml（流水线配置模板）
+- 创建 .skating.yaml（流水线配置模板，schema 为 pipeline.stages[].steps[]）
 - 创建 scripts/ 目录及示例 shell/lua 脚本
 - 将项目注册到全局 ~/.skating/projects.yaml
-- 如果 .skating.yaml 已存在，显示提示信息；使用 --force 强制覆盖
+- 如果 .skating.yaml 已存在，返回错误；使用 --force 强制覆盖
 - 项目名自动取当前目录名
 - 默认镜像为 "golang:1.21"
 
@@ -325,8 +361,10 @@ log("开始构建步骤...")
 set_env("CUSTOM_VAR", "value")
 ` + "```" + `
 
-### upload_artifact(路径) [尚未实现]
-上传构建产物的占位 API。
+### upload_artifact(路径) -> (目标路径, 错误)
+将本地文件复制到 ~/.skating/artifacts/<docker-镜像或-host>/<文件名>。
+成功时返回目标绝对路径，失败时返回空字符串 + 错误信息。
+` + "`" + `路径` + "`" + ` 可以是绝对路径，也可以是相对当前步骤工作目录的相对路径。
 
 ### Lua 安全沙箱
 - Lua 虚拟机中禁用了 os 和 io 模块
@@ -338,7 +376,12 @@ set_env("CUSTOM_VAR", "value")
 
 变量解析：
 - $变量名：从环境变量解析（如 $SKA_BUILD_ID）
-- 裸标识符：从上下文变量解析（如 branch）
+- 裸标识符：从自动检测的 git 上下文解析（branch、commit、git_dirty）
+
+自动注入的 git 上下文变量：
+- branch：    当前 git 分支名（git rev-parse --abbrev-ref HEAD）
+- commit：    短提交哈希（git rev-parse --short HEAD）
+- git_dirty：工作区有未提交修改则为 "true"，否则为 "false"
 
 若两边均可解析为数值，则使用数值比较；否则使用字符串比较。
 
@@ -346,6 +389,7 @@ set_env("CUSTOM_VAR", "value")
 - SKA_BUILD_ID == 5          （仅第 5 次构建）
 - SKA_BUILD_ID > 1           （第 2 次及之后）
 - branch == "main"           （仅 main 分支）
+- git_dirty == "false"       （仅工作区干净时）
 - ""（空字符串）               （始终执行，无条件）
 
 ## 环境变量
@@ -372,7 +416,30 @@ projects:
 ## 插件系统 (Yaegi)
 - 内置 ConsoleNotifier 在每次构建后打印结果摘要
 - 用户插件：放在 plugins/ 目录下的 Go 文件，启动时通过 Yaegi 解释器加载
-- 插件接口：Name()、Version()、Init()、Run(ctx) 方法
+- 插件接口方法：Name()、Version()、Init()（可选）、Run(ctx)
+
+### 插件文件格式
+插件文件必须声明 "package plug" 并导出一个名为 "Plugin" 的变量，其类型实现插件接口。
+Yaegi 只查找这个固定符号。
+` + "```go" + `
+// File: plugins/notify_slack.go
+package plug
+
+type SlackPlugin struct{}
+
+func (p *SlackPlugin) Name() string    { return "slack" }
+func (p *SlackPlugin) Version() string { return "1.0.0" }
+func (p *SlackPlugin) Init() error     { return nil }
+
+// 上下文字段：ProjectName、BuildID、Status ("success"/"failure")、Duration、Output (完整日志)
+func (p *SlackPlugin) Run(projectName string, buildID int, status string, duration string, output string) error {
+    // 发送到 webhook...
+    return nil
+}
+
+// Yaegi 查找这个固定符号
+var Plugin = &SlackPlugin{}
+` + "```" + `
 
 ## 示例
 参见 examples/ 目录的完整项目模板：

@@ -48,6 +48,10 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf(i18n.T("获取构建编号失败: %w", "get build ID failed: %w"), err)
 	}
+	// NextBuildID 已将 BuildID 持久化到磁盘，同步本地 project 副本避免后续 SaveProject 覆盖回旧值
+	project.BuildID = buildID
+	// 同步 image 字段到 store，保证 `skating ls` 显示最新镜像
+	project.Image = image
 
 	startTime := time.Now()
 
@@ -71,8 +75,13 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 
 	// 创建适配器：将 executor.Runner 适配到 pipeline.Executor 接口
-	runner := executor.NewRunner()
+	runner := executor.NewRunnerWithImage(image)
 	defer runner.CloseLua()
+
+	if image != "" && !runner.IsDockerAvailable() {
+		fmt.Fprintf(os.Stderr, i18n.T("警告: 配置了 Docker 镜像 %q 但 host 未检测到 docker 命令，将使用 host shell 执行。\n",
+			"Warning: Docker image %q configured but `docker` CLI not found, falling back to host shell.\n"), image)
+	}
 
 	adapter := &executorAdapter{
 		runner:  runner,

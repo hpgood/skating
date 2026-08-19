@@ -11,10 +11,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var initForce bool
+
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: i18n.T("初始化新项目", "Initialize a new project"),
 	RunE:  runInit,
+}
+
+func init() {
+	initCmd.Flags().BoolVar(&initForce, "force", false, i18n.T("强制覆盖已存在的配置文件", "force overwrite existing config files"))
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -24,40 +30,27 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	projName := filepath.Base(cwd)
 
-	// 1. 创建 .skating.yaml
-	skatingYaml := `name: ""  # 当前目录名
+	// 1. 创建 .skating.yaml（schema 必须与 internal/pipeline/dsl.go 一致：pipeline.stages[].steps[]）
+	skatingYaml := fmt.Sprintf(`name: %q
 image: golang:1.21
-steps:
-  - name: build
-    type: shell
-    script: |
-      echo "Building with SKA_BUILD_ID=${SKA_BUILD_ID}"
-      go build ./...
-`
+pipeline:
+  stages:
+    - name: build
+      parallel: false
+      steps:
+        - name: compile
+          type: shell
+          script: |
+            echo "Building with SKA_BUILD_ID=${SKA_BUILD_ID}"
+            go build ./...
+`, projName)
 	skatingYamlPath := filepath.Join(cwd, ".skating.yaml")
-	if err := os.WriteFile(skatingYamlPath, []byte(skatingYaml), 0644); err != nil {
+	if err := writeIfAllowed(skatingYamlPath, []byte(skatingYaml), 0644, initForce); err != nil {
 		return fmt.Errorf(i18n.T("创建 .skating.yaml 失败: %w", "create .skating.yaml failed: %w"), err)
 	}
 	fmt.Println(i18n.T("已创建 ", "Created ") + skatingYamlPath)
 
-	// 2. 创建 skating.star
-	starContent := `def pipeline():
-    return [
-        stage(
-            name = "build",
-            steps = [
-                step(name = "compile", type = "shell", script = "go build ./..."),
-            ],
-        ),
-    ]
-`
-	starPath := filepath.Join(cwd, "skating.star")
-	if err := os.WriteFile(starPath, []byte(starContent), 0644); err != nil {
-		return fmt.Errorf(i18n.T("创建 skating.star 失败: %w", "create skating.star failed: %w"), err)
-	}
-	fmt.Println(i18n.T("已创建 ", "Created ") + starPath)
-
-	// 3. 创建 scripts/ 目录和示例脚本
+	// 2. 创建 scripts/ 目录和示例脚本
 	scriptsDir := filepath.Join(cwd, "scripts")
 	if err := os.MkdirAll(scriptsDir, 0755); err != nil {
 		return fmt.Errorf(i18n.T("创建 scripts 目录失败: %w", "create scripts dir failed: %w"), err)
@@ -68,22 +61,27 @@ echo "Building project..."
 go build ./...
 `
 	buildShPath := filepath.Join(scriptsDir, "build.sh")
-	if err := os.WriteFile(buildShPath, []byte(buildSh), 0755); err != nil {
+	if err := writeIfAllowed(buildShPath, []byte(buildSh), 0755, initForce); err != nil {
 		return fmt.Errorf(i18n.T("创建 build.sh 失败: %w", "create build.sh failed: %w"), err)
 	}
 	fmt.Println(i18n.T("已创建 ", "Created ") + buildShPath)
 
+	// Lua 示例：用安全的 sh() API（沙箱已禁 os.execute）
 	buildLua := `-- build.lua
 print("Building project...")
-os.execute("go build ./...")
+local out, err = sh("go build ./...")
+if err then
+  error("build failed: " .. err)
+end
+print(out)
 `
 	buildLuaPath := filepath.Join(scriptsDir, "build.lua")
-	if err := os.WriteFile(buildLuaPath, []byte(buildLua), 0644); err != nil {
+	if err := writeIfAllowed(buildLuaPath, []byte(buildLua), 0644, initForce); err != nil {
 		return fmt.Errorf(i18n.T("创建 build.lua 失败: %w", "create build.lua failed: %w"), err)
 	}
 	fmt.Println(i18n.T("已创建 ", "Created ") + buildLuaPath)
 
-	// 4. 在 store 中注册项目
+	// 3. 在 store 中注册项目
 	s, err := store.NewStore()
 	if err != nil {
 		return fmt.Errorf(i18n.T("创建 store 失败: %w", "create store failed: %w"), err)
@@ -105,4 +103,16 @@ os.execute("go build ./...")
 
 	fmt.Printf(i18n.T("项目 %q 初始化成功。\n", "Project %q initialized successfully.\n"), projName)
 	return nil
+}
+
+// writeIfAllowed 在 force 为 true 或文件不存在时写入，否则返回 ErrFileExists
+func writeIfAllowed(path string, data []byte, perm os.FileMode, force bool) error {
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("file already exists (use --force to overwrite): %s", path)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.WriteFile(path, data, perm)
 }
