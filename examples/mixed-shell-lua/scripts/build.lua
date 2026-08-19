@@ -6,8 +6,8 @@
 log("=== Lua 编译步骤 ===")
 
 -- 获取环境变量
-local build_id = os.getenv("SKA_BUILD_ID")
-log("Build ID from Lua: " .. (build_id or "unknown"))
+local build_id = getenv("SKA_BUILD_ID")
+log("Build ID from Lua: " .. (build_id ~= "" and build_id or "unknown"))
 
 -- 使用 sh() 执行编译
 log("执行 go build...")

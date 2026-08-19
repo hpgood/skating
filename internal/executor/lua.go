@@ -149,6 +149,14 @@ func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWork
 		return 0
 	}))
 
+	// getenv(name) - 读取环境变量 (返回字符串, 未设置返回空字符串)
+	// 配套 set_env; 弥补 Lua 标准库 os.getenv 被沙箱禁用后的环境变量访问需求
+	L.SetGlobal("getenv", L.NewFunction(func(L *lua.LState) int {
+		name := L.CheckString(1)
+		L.Push(lua.LString(env[name]))
+		return 1
+	}))
+
 	// upload_artifact(path) - 上传构建产物（写到 ~/.skating/artifacts/）
 	L.SetGlobal("upload_artifact", L.NewFunction(func(L *lua.LState) int {
 		path := L.CheckString(1)

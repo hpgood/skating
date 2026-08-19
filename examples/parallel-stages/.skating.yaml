@@ -49,8 +49,8 @@ pipeline:
           type: lua
           script: |
             log("=== 生成构建报告 ===")
-            local build_id = os.getenv("SKA_BUILD_ID")
-            if build_id then
+            local build_id = getenv("SKA_BUILD_ID")
+            if build_id and build_id ~= "" then
               set_env("REPORT_FILE", "build-" .. build_id .. "-report.txt")
               log("报告文件: build-" .. build_id .. "-report.txt")
             else

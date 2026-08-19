@@ -47,5 +47,5 @@ pipeline:
           type: lua
           script: |
             log("=== 无条件步骤 ===")
-            local build_id = os.getenv("SKA_BUILD_ID")
-            log("当前构建编号: " .. (build_id or "unknown"))
+            local build_id = getenv("SKA_BUILD_ID")
+            log("当前构建编号: " .. (build_id or ""))
