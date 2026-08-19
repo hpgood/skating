@@ -78,9 +78,17 @@ func executeStep(stageName string, step Step, exec Executor, env map[string]stri
 		StepName:  step.Name,
 	}
 
-	// 条件判断
+// 条件判断
 	if step.When != "" {
-		ok, err := EvalWhen(step.When, env, env)
+		// 自动注入 git 上下文变量（branch / commit / git_dirty）到 ctx
+		ctx := BuildGitContext("")
+		// 把 ctx 也合并到 env（裸标识符查询时优先用 env 命中），保持双视图
+		for k, v := range ctx {
+			if _, exists := env[k]; !exists {
+				env[k] = v
+			}
+		}
+		ok, err := EvalWhen(step.When, env, ctx)
 		if err != nil {
 			result.Status = "failed"
 			result.Error = fmt.Sprintf("eval condition: %v", err)
