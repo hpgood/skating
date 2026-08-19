@@ -217,6 +217,25 @@ See the [examples/](./examples/) directory:
 | [parallel-stages](./examples/parallel-stages/) | Parallel stage execution |
 | [conditional-build](./examples/conditional-build/) | When condition examples |
 
+### Try `--step` and `--env` with the examples
+
+Each example's `.skating.yaml` uses distinct stage/step names — pick one and experiment:
+
+```bash
+# Mixed shell + Lua: 3 stages, perfect for showing --step granularity
+skating run mixed-shell-lua-example --step shell-stage             # only stage 1
+skating run mixed-shell-lua-example --step lua-stage/lua-build-with-logic  # only one Lua step
+skating run mixed-shell-lua-example --step shell-verify            # only verify stage
+
+# Override a SKA_BUILD_* env var to replay a build with a fixed ID
+skating run go-project --env SKA_BUILD_ID=999
+
+# Combine: deploy only the release step with a custom target
+skating run node-project --step deploy/release --env DEPLOY_TARGET=canary
+```
+
+See [`examples/mixed-shell-lua/README.md`](./examples/mixed-shell-lua/README.md) for the full worked walkthrough.
+
 ## License
 
 MIT

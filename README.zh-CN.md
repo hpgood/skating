@@ -216,6 +216,25 @@ log("Unix seconds: " .. ts)
 | [parallel-stages](./examples/parallel-stages/) | 并行 Stage 执行 |
 | [conditional-build](./examples/conditional-build/) | When 条件判断 |
 
+### 用 examples 试用 `--step` 和 `--env`
+
+每个 example 的 `.skating.yaml` 都有清晰的 stage/step 命名，挑一个动手试：
+
+```bash
+# 混合 shell + Lua：3 个 stage，最适合演示 --step 粒度
+skating run mixed-shell-lua-example --step shell-stage             # 只跑 stage 1
+skating run mixed-shell-lua-example --step lua-stage/lua-build-with-logic  # 只跑单个 Lua step
+skating run mixed-shell-lua-example --step shell-verify            # 只跑验证 stage
+
+# 覆盖 SKA_BUILD_* 用于重放/调试
+skating run go-project --env SKA_BUILD_ID=999
+
+# 组合使用：只跑 release step 并指定自定义目标
+skating run node-project --step deploy/release --env DEPLOY_TARGET=canary
+```
+
+完整演练参见 [`examples/mixed-shell-lua/README.md`](./examples/mixed-shell-lua/README.md)。
+
 ## License
 
 MIT
