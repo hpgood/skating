@@ -11,19 +11,21 @@ import (
 var cleanAll bool
 
 var cleanCmd = &cobra.Command{
-	Use:   "clean <project-name>",
+	Use:   "clean [project-name]",
 	Short: i18n.T("清空构建日志（保留 BuildID 和项目注册信息）", "Clear build logs (keeps BuildID and registry)"),
 	Long: i18n.T(
 		`清空指定项目或所有项目的历史构建日志文件。
 项目注册信息和构建编号 (BuildID) 不会受影响。
 
 示例:
+  skating clean              清空当前目录项目的日志
   skating clean myproject   清空 myproject 的日志
   skating clean --all        清空所有项目的日志`,
 		`Clear build log files for specific or all projects.
 Project registry and BuildID counter are preserved.
 
 Examples:
+  skating clean              Clear logs for the current directory's project
   skating clean myproject   Clear logs for myproject
   skating clean --all        Clear logs for all projects`,
 	),
@@ -51,11 +53,7 @@ func runClean(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if len(args) == 0 {
-		return fmt.Errorf("%s", i18n.T("请指定项目名或使用 --all 清空所有日志", "specify a project name or use --all to clean all logs"))
-	}
-
-	projName := args[0]
+	projName := resolveProjectName(args)
 
 	_, err = s.GetProject(projName)
 	if err != nil {

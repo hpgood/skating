@@ -41,5 +41,5 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&lang, "lang", "en", "language (en, zh-CN)")
-	rootCmd.AddCommand(initCmd, configCmd, lsCmd, runCmd, logsCmd, cleanCmd, skillCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, configCmd, lsCmd, runCmd, updateCmd, logsCmd, cleanCmd, skillCmd, versionCmd)
 }

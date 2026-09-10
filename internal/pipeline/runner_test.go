@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,8 @@ type fakeExecutor struct {
 	// 验证并发：每个 step 启动时记录时间戳
 	startTimes map[string]time.Time
 	endTimes   map[string]time.Time
+	// 记录每个 step 收到的 env，用于验证平台环境变量注入
+	envs map[string]map[string]string
 }
 
 type fakeResult struct {
@@ -26,12 +29,14 @@ func newFakeExecutor() *fakeExecutor {
 		results:    map[string]fakeResult{},
 		startTimes: map[string]time.Time{},
 		endTimes:   map[string]time.Time{},
+		envs:       map[string]map[string]string{},
 	}
 }
 
-func (f *fakeExecutor) Execute(step Step, env map[string]string) (string, error) {
+func (f *fakeExecutor) Execute(step Step, env map[string]string, logFn func(string)) (string, error) {
 	f.mu.Lock()
 	f.startTimes[step.Name] = time.Now()
+	f.envs[step.Name] = env
 	r, ok := f.results[step.Name]
 	if !ok {
 		r = fakeResult{output: "ok"}
@@ -217,5 +222,90 @@ func TestRunPipeline_AllSuccess(t *testing.T) {
 		if r.Status != "success" {
 			t.Errorf("%s status = %s, want success", r.StepName, r.Status)
 		}
+	}
+}
+
+func TestStep_ResolveEnv_PlatformGroups(t *testing.T) {
+	step := Step{
+		Name: "compile",
+		Env: map[string]map[string]string{
+			"default": {"myEnv": "abc", "GOARCH": "amd64"},
+			"windows": {"GOOS": "windows"},
+			"linux":   {"GOOS": "linux"},
+		},
+	}
+
+	// windows 平台：default + windows
+	w := step.ResolveEnv("windows")
+	if w["myEnv"] != "abc" || w["GOARCH"] != "amd64" || w["GOOS"] != "windows" {
+		t.Errorf("windows env = %v, want myEnv=abc GOARCH=amd64 GOOS=windows", w)
+	}
+	if len(w) != 3 {
+		t.Errorf("windows env len = %d, want 3", len(w))
+	}
+
+	// linux 平台：default + linux
+	l := step.ResolveEnv("linux")
+	if l["myEnv"] != "abc" || l["GOOS"] != "linux" {
+		t.Errorf("linux env = %v, want myEnv=abc GOOS=linux", l)
+	}
+	if len(l) != 3 {
+		t.Errorf("linux env len = %d, want 3", len(l))
+	}
+
+	// darwin 平台：仅 default
+	d := step.ResolveEnv("darwin")
+	if d["myEnv"] != "abc" || d["GOOS"] != "" {
+		t.Errorf("darwin env = %v, want only default group", d)
+	}
+
+	// 平台专属变量覆盖 default 同名变量
+	ov := Step{Env: map[string]map[string]string{
+		"default": {"X": "base"},
+		"linux":   {"X": "linux-value"},
+	}}
+	if got := ov.ResolveEnv("linux")["X"]; got != "linux-value" {
+		t.Errorf("platform override failed: X = %q, want linux-value", got)
+	}
+
+	// 空 env 返回 nil
+	if empty := (Step{}).ResolveEnv("windows"); empty != nil {
+		t.Errorf("empty step env = %v, want nil", empty)
+	}
+}
+
+func TestExecuteStep_InjectsPlatformEnv(t *testing.T) {
+	exec := newFakeExecutor()
+	step := Step{
+		Name: "compile",
+		Env: map[string]map[string]string{
+			"default": {"myEnv": "abc"},
+			"windows": {"GOOS": "windows"},
+			"linux":   {"GOOS": "linux"},
+		},
+	}
+	globalEnv := map[string]string{"SKA_BUILD_ID": "1"}
+	result := executeStep("stage", step, exec, globalEnv, func(s string) {})
+
+	if result.Status != "success" {
+		t.Fatalf("expected success, got %s", result.Status)
+	}
+
+	got := exec.envs["compile"]
+	if got["myEnv"] != "abc" {
+		t.Errorf("default group not injected: %v", got)
+	}
+	if got["SKA_BUILD_ID"] != "1" {
+		t.Errorf("global env lost: %v", got)
+	}
+	// 当前编译平台的分组应被注入（windows 或 linux 二选一）
+	plat, hasPlat := got["GOOS"]
+	if !hasPlat || (plat != runtime.GOOS) {
+		t.Errorf("platform group not injected: GOOS = %q, want %q", plat, runtime.GOOS)
+	}
+
+	// 共享的全局 env 不能被 step env 污染
+	if _, leaked := globalEnv["myEnv"]; leaked {
+		t.Error("step env leaked into shared global env")
 	}
 }

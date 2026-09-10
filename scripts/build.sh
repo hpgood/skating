@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "Building project..."
+go build ./...

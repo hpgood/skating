@@ -1,0 +1,27 @@
+name: "skating"
+image: ""
+pipeline:
+  stages:
+    - name: build
+      parallel: false
+      steps:
+        - name: compile
+          type: shell
+          env:
+            default: 
+              version: "0.2.1"
+            windows: 
+              GOARCH: "amd64"
+              GOOS: "windows"
+              Ext: ".exe"
+              SKA_SHELL: "powershell"
+            linux: 
+              GOARCH: "amd64"
+              GOOS: "linux"
+              Ext: ""
+              SKA_SHELL: "bash"
+          script: |
+            echo "Building with SKA_BUILD_ID=${SKA_BUILD_ID}"
+            echo "Ext=${Ext}"
+            echo "GOOS=${GOOS}"
+            go build -ldflags="-X main.version=${version} -X main.date=${SKA_BUILD_DATE}" -o "build/skating${Ext}" ./cmd/skating 

@@ -32,7 +32,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	// 1. 创建 .skating.yaml（schema 必须与 internal/pipeline/dsl.go 一致：pipeline.stages[].steps[]）
 	skatingYaml := fmt.Sprintf(`name: %q
-image: golang:1.21
+image: ""
 pipeline:
   stages:
     - name: build
@@ -40,6 +40,19 @@ pipeline:
       steps:
         - name: compile
           type: shell
+          env:
+            default:
+              version: "0.1.0"
+            windows:
+              GOARCH: "amd64"
+              GOOS: "windows"
+              Ext: ".exe"
+              SKA_SHELL: "powershell" # 指定 script 执行的 shell，默认 windows=powershell, linux=bash
+            linux:
+              GOARCH: "amd64"
+              GOOS: "linux"
+              Ext: ""
+              SKA_SHELL: "bash"
           script: |
             echo "Building with SKA_BUILD_ID=${SKA_BUILD_ID}"
             go build ./...

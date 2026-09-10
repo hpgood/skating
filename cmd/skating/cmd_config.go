@@ -11,14 +11,35 @@ import (
 )
 
 var configCmd = &cobra.Command{
-	Use:   "config <project-name>",
+	Use:   "config [project-name]",
 	Short: i18n.T("查看项目配置", "Configure project settings"),
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runConfig,
 }
 
+// resolveProjectName 项目名可选：显式传入优先；无参时取当前目录
+// .skating.yaml 的 name（缺省用目录名）。config/logs/clean 共用。
+func resolveProjectName(args []string) string {
+	if len(args) > 0 {
+		return args[0]
+	}
+	return defaultProjectName()
+}
+
+func defaultProjectName() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	name := readProjectName(filepath.Join(cwd, ".skating.yaml"))
+	if name == "" {
+		name = filepath.Base(cwd)
+	}
+	return name
+}
+
 func runConfig(cmd *cobra.Command, args []string) error {
-	projName := args[0]
+	projName := resolveProjectName(args)
 
 	s, err := store.NewStore()
 	if err != nil {

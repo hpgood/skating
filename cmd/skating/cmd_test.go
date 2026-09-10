@@ -150,8 +150,8 @@ func executeCmd(t *testing.T, args ...string) (stdout, stderr string) {
 }
 
 // TestInit_CreatesProjectAndFiles 验证 init 命令端到端：
-//  - 生成 .skating.yaml + scripts/build.sh + scripts/build.lua
-//  - 在 ~/.skating/projects.yaml 里注册 Project，name 取自 cwd basename
+//   - 生成 .skating.yaml + scripts/build.sh + scripts/build.lua
+//   - 在 ~/.skating/projects.yaml 里注册 Project，name 取自 cwd basename
 func TestInit_CreatesProjectAndFiles(t *testing.T) {
 	home := setupE2E(t)
 	projDir := filepath.Join(home, "myproj")
@@ -240,11 +240,11 @@ func TestInit_RefusesOverwrite(t *testing.T) {
 }
 
 // TestRun_BuildIDIncrementsThenLogsReads 串联 run → logs 验证：
-//  - run 成功后 build ID 自动递增到 1
-//  - 再 run 一次后 build ID 应该是 2（验证 8/18 修过的 #3 BuildID 不自增 bug）
-//  - logs 默认读 latest，logs --id 2 能读到第二次 build 的日志
-//  - logs --last N 能列出摘要
-//  - run 失败时 exit code != 0，log 里带 "=== Build FAILED ===" marker
+//   - run 成功后 build ID 自动递增到 1
+//   - 再 run 一次后 build ID 应该是 2（验证 8/18 修过的 #3 BuildID 不自增 bug）
+//   - logs 默认读 latest，logs --id 2 能读到第二次 build 的日志
+//   - logs --last N 能列出摘要
+//   - run 失败时 exit code != 0，log 里带 "=== Build FAILED ===" marker
 func TestRun_BuildIDIncrementsThenLogsReads(t *testing.T) {
 	home := setupE2E(t)
 	projDir := filepath.Join(home, "buildme")
@@ -477,10 +477,11 @@ pipeline:
 	}
 
 	// 2. SKA_BUILD_TIMESTAMP must be exactly 10-digit unix seconds
+	// Windows PowerShell echo 输出 CRLF，行尾需去掉 '\r'
 	var tsStr string
 	for _, line := range strings.Split(combined, "\n") {
 		if strings.HasPrefix(line, "SKA_BUILD_TIMESTAMP=") {
-			tsStr = strings.TrimPrefix(line, "SKA_BUILD_TIMESTAMP=")
+			tsStr = strings.TrimRight(strings.TrimPrefix(line, "SKA_BUILD_TIMESTAMP="), "\r")
 		}
 	}
 	if tsStr == "" {
@@ -502,7 +503,7 @@ pipeline:
 	var dateStr string
 	for _, line := range strings.Split(combined, "\n") {
 		if strings.HasPrefix(line, "SKA_BUILD_DATE=") {
-			dateStr = strings.TrimPrefix(line, "SKA_BUILD_DATE=")
+			dateStr = strings.TrimRight(strings.TrimPrefix(line, "SKA_BUILD_DATE="), "\r")
 		}
 	}
 	if dateStr == "" {
@@ -522,10 +523,11 @@ pipeline:
 		t.Errorf("ROUNDTRIP line missing — cannot verify TS/DATE consistency: %q", combined)
 	}
 	// Find ROUNDTRIP line and SKA_BUILD_DATE line, compare
+	// Windows PowerShell 没有 GNU date -u -d，ROUNDTRIP 输出为空 —— 为空时跳过比较
 	var roundtripStr string
 	for _, line := range strings.Split(combined, "\n") {
 		if strings.HasPrefix(line, "ROUNDTRIP=") {
-			roundtripStr = strings.TrimPrefix(line, "ROUNDTRIP=")
+			roundtripStr = strings.TrimRight(strings.TrimPrefix(line, "ROUNDTRIP="), "\r")
 		}
 	}
 	if roundtripStr != "" && roundtripStr != dateStr {
@@ -538,9 +540,10 @@ pipeline:
 // 其他 stage 和同 stage 内其他 step 都记为 skipped。
 //
 // Pipeline 设计（避免 host shell 干扰，shell step 一律 exit 0 让 stdout 进 stderr）：
-//   stage-pre:   step-pre-only
-//   stage-build: step-keep (被选中的, exit 1), step-skip (同 stage, exit 0)
-//   stage-post:  step-post-only
+//
+//	stage-pre:   step-pre-only
+//	stage-build: step-keep (被选中的, exit 1), step-skip (同 stage, exit 0)
+//	stage-post:  step-post-only
 //
 // 预期: step-pre-only / step-skip / step-post-only 都在 results 里 status=skipped;
 // step-keep 是 status=failed (因为 exit 1) 且 stdout 含 "KEEP-RAN"。
@@ -624,8 +627,9 @@ pipeline:
 // 其他 stage 记为 skipped；同 stage 内所有 step 都跑。
 //
 // 设计:
-//   stage-build: step-a (exit 0), step-b (exit 0)
-//   stage-other: step-x (exit 0)
+//
+//	stage-build: step-a (exit 0), step-b (exit 0)
+//	stage-other: step-x (exit 0)
 //
 // 预期: step-a / step-b 都真的跑（"A-RAN" "B-RAN" 出现），step-x 被 skipped。
 func TestRun_StepFilterSingleStage(t *testing.T) {

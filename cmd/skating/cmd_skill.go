@@ -35,44 +35,65 @@ Otherwise shell steps fall back to running directly on the host shell.
 
 ### skating init
 Initialize a skating project in the current directory.
-- Creates .skating.yaml (pipeline config template, schema: pipeline.stages[].steps[])
+- Creates .skating.yaml with a sample build stage. The template includes step env
+  platform groups (default / windows / linux) and SKA_SHELL examples
 - Creates scripts/ directory with example shell/lua scripts
 - Registers the project in global ~/.skating/projects.yaml
 - If .skating.yaml already exists, returns an error; use --force to overwrite
 - The project name is auto-derived from the current directory name
-- Image defaults to "golang:1.21"
+- The template sets image: "" (steps run on the host shell); set a docker image
+  in .skating.yaml to build inside a container instead
 
-### skating config <project>
-Display the .skating.yaml configuration for a registered project.
-
-### skating ls
-List all registered projects with their name, path, docker image, last build status, and last build time.
-Status values: "success", "failure", "none" (never built).
-
-### skating run <project>
-Execute the full pipeline for a project.
+### skating run [project-name]
+Execute the full pipeline. The project name is optional:
+- With a name: run the registered project
+- Without a name (ad-hoc mode): use the .skating.yaml in the current directory;
+  the project is auto-registered if not yet known
+Options:
+- --step <stage> or <stage>/<step>: run only the named stage or step.
+  Stages/steps not selected are recorded as skipped. In --step <stage> mode a
+  sequential stage continues past a failing step so the whole stage reports.
+- --env KEY=VAL: inject custom env into steps. Repeatable; later values win;
+  on conflict user values override skating system env (SKA_*)
 Workflow:
-1. Load project from ~/.skating/projects.yaml
-2. Read .skating.yaml from project path
-3. Increment and inject SKA_BUILD_ID environment variable
-4. Parse pipeline stages/steps from .skating.yaml
-5. Execute stages sequentially; within a stage with parallel=true, run steps concurrently
-6. For each step: evaluate When condition (if any), then dispatch to shell or lua executor
-7. Stream output to terminal and buffer for log persistence
-8. Save log to ~/.skating/logs/<project>/<buildID>.log
-9. Update project status and timestamp in projects.yaml
-10. Run all registered plugins (builtin ConsoleNotifier + user Yaegi plugins)
-11. Print build summary with per-step status, icon, and duration
+1. Load project (registry or ad-hoc) and read .skating.yaml from the project path
+2. Increment and inject SKA_BUILD_ID (plus SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE)
+3. Execute stages sequentially; within a stage with parallel=true, run steps concurrently
+4. For each step: evaluate the When condition (if any), merge step-level env
+   (platform-aware), then dispatch to the shell or lua executor
+5. Stream output to the terminal line-by-line and buffer it for log persistence
+6. Save log to ~/.skating/logs/<project>/<buildID>.log (plain text, ANSI stripped)
+7. Update project status and timestamp in projects.yaml
+8. Run all registered plugins (builtin ConsoleNotifier + user Yaegi plugins)
+9. Print build summary with per-step status, icon, and duration
 
-### skating logs <project>
+### skating config [project]
+Display the .skating.yaml configuration for a project. The name is optional —
+it defaults to the project in the current directory (name from .skating.yaml,
+falling back to the directory name). The same rule applies to logs and clean.
+
+### skating logs [project]
 View build logs.
 - Default: show the most recent log in full
 - --id N: show log for build ID N in full
 - --last N: show summary of last N builds (build ID, status only, not full log)
 
-### skating clean <project>
-Clear build log files for a project. BuildID counter and project registry are preserved.
---all flag clears logs for all projects.
+### skating clean [project]
+Clear build log files for a project (defaults to the current directory project).
+BuildID counter and project registry are preserved. --all clears logs for all projects.
+
+### skating update
+Sync name/image from the current directory .skating.yaml to the global registry:
+- Project not registered yet → register it
+- Same name already registered → update image and path
+- Same path registered under an old name (yaml name changed) → rename the project
+
+### skating ls
+List all registered projects with their name, path, docker image, last build status, and last build time.
+Status values: "success", "failure", "none" (never built).
+
+### skating version
+Print version information (commit, build date).
 
 ### skating skill
 Output this SKILL document. Use --lang zh-CN for Chinese.
@@ -82,7 +103,7 @@ Output this SKILL document. Use --lang zh-CN for Chinese.
 ### Full Schema
 ` + "```yaml" + `
 name: project-name          # Project identifier
-image: docker-image:tag     # Docker image for isolated builds (optional)
+image: docker-image:tag     # Docker image for isolated builds (optional; empty = host shell)
 pipeline:
   stages:
     - name: stage-name
@@ -94,6 +115,13 @@ pipeline:
             echo "hello"
           source: path/script.sh  # External script path (alternative to script)
           when: "expression"      # Condition to evaluate (see When Conditions)
+          env:                    # Step-level env, grouped by platform (optional)
+            default:              # Injected on every platform
+              version: "0.1.0"
+            windows:              # Injected only when GOOS == windows
+              Ext: ".exe"
+            linux:                # Injected only when GOOS == linux
+              Ext: ""
 ` + "```" + `
 
 ### Step Fields
@@ -102,6 +130,10 @@ pipeline:
 - script: Inline script content. For shell: bash commands. For lua: Lua code.
 - source: Path to external script file. Mutually exclusive with script (use one).
 - when: Conditional expression. Step is skipped if false. Empty/absent means always run.
+- env: (optional) Step-level environment variables grouped by platform. Group key
+  "default" applies on every platform; other keys (windows/linux/darwin...) apply
+  when the key matches the runtime GOOS. Platform groups override same-name
+  variables from default.
 
 ### Stage Fields
 - name: (required) Stage name
@@ -112,14 +144,36 @@ pipeline:
 - Stages run sequentially; a failing stage stops the entire pipeline
 - Within a serial stage, steps run in order; a failing step stops the stage
 - Within a parallel stage, all steps start concurrently; first failure is reported after all complete
+- With --step filtering, stages/steps not selected are recorded as skipped (visible
+  in the summary); in --step <stage> mode a sequential stage continues past failing
+  steps so the whole stage reports, while the overall build stays failed
 
 ## Shell Executor
-- On Linux/macOS: scripts run via /bin/bash
-- On Windows: scripts run via PowerShell
+- Default shell: /bin/bash on Linux/macOS, PowerShell on Windows
+- SKA_SHELL env var overrides the executing shell. Format: "<shell> [args...]" —
+  the first token is the shell, remaining tokens become shell flags, and the
+  script path is appended automatically. Example: SKA_SHELL: "pwsh -NoLogo".
+  bash/sh get "-x"; powershell gets "-ExecutionPolicy Bypass -File"
 - Inline scripts are written to a temp file, executed, then the temp file is deleted
 - External scripts (source) run directly from the project directory
-- All environment variables from env map are injected into the command
-- stdout and stderr are captured and returned
+- Environment: SKA_* system vars + step env (platform-resolved) are injected into
+  the command environment
+- stdout/stderr are streamed line-by-line to the live log and captured; log files
+  and plugins receive plain text (ANSI colors stripped)
+
+### PowerShell notes (Windows)
+- The output stream is forced to UTF-8, and inline scripts get a UTF-8 BOM so
+  non-ASCII text is decoded correctly on Windows PowerShell 5.1
+- Scripts run with Set-PSDebug -Trace 1, so DEBUG: trace lines appear in the log
+- Injected env vars are also exposed as PowerShell variables ($VAR) in the script
+- Native command failures propagate: a trailing "exit $LASTEXITCODE" line makes
+  the step fail when the last native command (go build, etc.) failed — matching
+  GitHub Actions pwsh behavior. Pure cmdlet scripts and scripts with an explicit
+  exit are unaffected.
+
+### Docker execution
+- Shell steps run via "docker run --rm <image> bash -x <script>" by default;
+  SKA_SHELL overrides the shell inside the container using the same rules
 
 ## Lua Executor (Gopher-Lua)
 Runs Lua scripts in-process using the gopher-lua VM. The following APIs are exposed to Lua:
@@ -158,7 +212,8 @@ Condition expressions support the following operators: ==, !=, >, <, >=, <=
 
 Variable resolution:
 - $VAR_NAME: resolved from environment variables (e.g., $SKA_BUILD_ID)
-- bare_identifier: resolved from auto-detected git context (branch, commit, git_dirty)
+- bare_identifier: resolved from env first, then auto-detected git context
+  (branch, commit, git_dirty), otherwise treated as a literal string
 
 Auto-detected git context (available to bare identifiers):
 - branch:   current git branch name (git rev-parse --abbrev-ref HEAD)
@@ -176,6 +231,11 @@ Examples:
 
 ## Environment Variables
 - SKA_BUILD_ID: Auto-injected, increments from 1 per project. Available in all steps.
+- SKA_BUILD_TIMESTAMP: Auto-injected, unix seconds (UTC) of the build start time.
+- SKA_BUILD_DATE: Auto-injected, RFC3339 (UTC) human-readable build date.
+- SKA_SHELL: Optional, set via step env, overrides the executing shell (see Shell Executor).
+- Step env: defined per step in .skating.yaml (default + platform groups).
+- --env KEY=VAL (skating run): user-provided; overrides SKA_* system values on conflict.
 - User-defined via set_env() in Lua scripts.
 
 ## Data Storage
@@ -236,8 +296,8 @@ To create a CI pipeline for a user's project:
 1. cd into the project directory
 2. Run: skating init
 3. Edit .skating.yaml to define stages/steps appropriate for the project
-4. Run: skating run <project-name>
-5. Check results with: skating logs <project-name>
+4. Run: skating run (project name optional; without it the current directory is used)
+5. Check results with: skating logs
 `
 
 const skillDocZhCN = `# SKATING SKILL（中文）
@@ -253,44 +313,63 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 
 ### skating init
 在当前目录初始化一个 skating 项目。
-- 创建 .skating.yaml（流水线配置模板，schema 为 pipeline.stages[].steps[]）
+- 创建 .skating.yaml，内含示例 build stage。模板带 step env 平台分组
+  （default / windows / linux）以及 SKA_SHELL 示例
 - 创建 scripts/ 目录及示例 shell/lua 脚本
 - 将项目注册到全局 ~/.skating/projects.yaml
 - 如果 .skating.yaml 已存在，返回错误；使用 --force 强制覆盖
 - 项目名自动取当前目录名
-- 默认镜像为 "golang:1.21"
+- 模板 image 为 ""（步骤直接在 host shell 执行）；在 .skating.yaml 设置
+  docker 镜像可改为容器内构建
 
-### skating config <项目名>
-显示已注册项目的 .skating.yaml 配置内容。
-
-### skating ls
-列出所有已注册项目的名称、路径、Docker 镜像、最近构建状态和最近构建时间。
-状态值："success"（成功）、"failure"（失败）、"none"（从未构建）。
-
-### skating run <项目名>
-执行项目的完整流水线。
+### skating run [项目名]
+执行项目的完整流水线。项目名可选：
+- 传名称：运行已注册项目
+- 不传（adhoc 模式）：使用当前目录的 .skating.yaml；未注册时自动注册
+选项：
+- --step <stage> 或 <stage>/<step>：只运行指定 stage 或 step。未选中的
+  stage/step 会记为 skipped。--step <stage> 模式下，串行 stage 中某 step
+  失败后仍继续跑完剩余 step，便于看到整个 stage 的完整结果
+- --env KEY=VAL：向 step 注入自定义环境变量。可重复传入，后者覆盖前者；
+  与系统 SKA_* 变量冲突时用户值优先
 工作流：
-1. 从 ~/.skating/projects.yaml 加载项目信息
-2. 从项目路径读取 .skating.yaml
-3. 递增并注入 SKA_BUILD_ID 环境变量
-4. 解析 .skating.yaml 中的 stages/steps
-5. 按顺序执行各 Stage；若 Stage 设置 parallel=true，则并发执行其中的 Steps
-6. 对每个 Step：先评估 When 条件（如有），然后分发到 shell 或 lua 执行器
-7. 输出流式输出到终端，同时缓冲用于日志持久化
-8. 将日志保存到 ~/.skating/logs/<项目名>/<buildID>.log
-9. 更新 projects.yaml 中的项目状态和时间戳
-10. 运行所有已注册插件（内置 ConsoleNotifier + 用户 Yaegi 插件）
-11. 打印构建摘要，包含每个 Step 的状态、图标和耗时
+1. 加载项目（注册表或 adhoc），从项目路径读取 .skating.yaml
+2. 递增并注入 SKA_BUILD_ID（同时注入 SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE）
+3. 按顺序执行各 Stage；若 Stage 设置 parallel=true，则并发执行其中的 Steps
+4. 对每个 Step：先评估 When 条件（如有），再合并 step 级 env（按平台解析），
+   最后分发到 shell 或 lua 执行器
+5. 输出按行实时流式转发到终端，同时缓冲用于日志持久化
+6. 将日志保存到 ~/.skating/logs/<项目名>/<buildID>.log（纯文本，已剥离 ANSI）
+7. 更新 projects.yaml 中的项目状态和时间戳
+8. 运行所有已注册插件（内置 ConsoleNotifier + 用户 Yaegi 插件）
+9. 打印构建摘要，包含每个 Step 的状态、图标和耗时
 
-### skating logs <项目名>
+### skating config [项目名]
+显示项目的 .skating.yaml 配置内容。项目名可选——默认取当前目录对应的项目
+（读 .skating.yaml 的 name，缺省用目录名）。logs 和 clean 同规则。
+
+### skating logs [项目名]
 查看构建日志。
 - 默认：显示最近一次构建的完整日志
 - --id N：显示构建 ID 为 N 的完整日志
 - --last N：显示最近 N 次构建的摘要（仅构建ID、状态，不含完整日志）
 
-### skating clean <项目名>
-清空项目的构建日志文件。BuildID 计数器和项目注册信息保持不变。
---all 标志清空所有项目的日志。
+### skating clean [项目名]
+清空项目的构建日志文件（默认当前目录对应的项目）。BuildID 计数器和项目注册信息保持不变。
+--all 清空所有项目的日志。
+
+### skating update
+将当前目录 .skating.yaml 的 name/image 同步到全局注册表：
+- 项目未注册 → 注册新项目
+- 同名项目已注册 → 更新 image 与 path
+- 同路径记录存在但名字不匹配（yaml 里改过名）→ 重命名项目
+
+### skating ls
+列出所有已注册项目的名称、路径、Docker 镜像、最近构建状态和最近构建时间。
+状态值："success"（成功）、"failure"（失败）、"none"（从未构建）。
+
+### skating version
+输出版本信息（commit、构建日期）。
 
 ### skating skill
 输出本文档。默认英文，使用 --lang zh-CN 切换中文。
@@ -300,7 +379,7 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 ### 完整 Schema
 ` + "```yaml" + `
 name: project-name          # 项目标识
-image: docker-image:tag     # Docker 镜像（可选）
+image: docker-image:tag     # Docker 镜像（可选；为空则直接在 host shell 执行）
 pipeline:
   stages:
     - name: stage-name
@@ -312,6 +391,13 @@ pipeline:
             echo "hello"
           source: path/script.sh  # 外部脚本路径（与 script 二选一）
           when: "表达式"          # 条件表达式（见 When 条件）
+          env:                    # step 级环境变量，按平台分组（可选）
+            default:              # 所有平台都注入
+              version: "0.1.0"
+            windows:              # 仅 GOOS == windows 时注入
+              Ext: ".exe"
+            linux:                # 仅 GOOS == linux 时注入
+              Ext: ""
 ` + "```" + `
 
 ### Step 字段说明
@@ -320,6 +406,9 @@ pipeline:
 - script：内联脚本内容。shell 类型为 bash 命令，lua 类型为 Lua 代码
 - source：外部脚本文件路径。与 script 互斥（只能使用一个）
 - when：条件表达式。若为 false 则跳过该 Step。为空或未设置表示始终执行
+- env：（可选）step 级环境变量，按平台分组。分组键 "default" 对所有平台生效；
+  其余键（windows/linux/darwin...）仅在键名等于当前 GOOS 时生效；
+  平台组覆盖 default 中同名变量
 
 ### Stage 字段说明
 - name：（必填）Stage 名称
@@ -330,14 +419,34 @@ pipeline:
 - Stage 按顺序执行；失败的 Stage 会终止整个流水线
 - 串行 Stage 中，Steps 按顺序执行；失败的 Step 会终止该 Stage
 - 并行 Stage 中，所有 Steps 同时启动；所有完成后报告首个失败
+- 使用 --step 过滤时，未选中的 stage/step 记为 skipped（在摘要中可见）；
+  --step <stage> 模式下串行 stage 失败后继续执行剩余 step 以报告完整结果，
+  但整体构建状态仍为失败
 
 ## Shell 执行器
-- Linux/macOS：通过 /bin/bash 执行脚本
-- Windows：通过 PowerShell 执行脚本
+- 默认 shell：Linux/macOS 为 /bin/bash，Windows 为 PowerShell
+- 环境变量 SKA_SHELL 可覆盖执行 shell。格式 "<shell> [参数...]"——首个 token
+  为 shell，其余 token 作为 shell 参数，脚本路径自动追加。
+  示例：SKA_SHELL: "pwsh -NoLogo"。bash/sh 自动加 "-x"；
+  powershell 自动加 "-ExecutionPolicy Bypass -File"
 - 内联脚本写入临时文件，执行后删除
 - 外部脚本（source）直接从项目目录运行
-- 所有环境变量注入到命令中
-- stdout 和 stderr 均被捕获返回
+- 环境变量：SKA_* 系统变量 + step env（按平台解析）注入命令环境
+- stdout/stderr 按行实时转发到实时日志并捕获；日志文件与插件收到的是
+  纯文本（已剥离 ANSI 颜色）
+
+### PowerShell 说明（Windows）
+- 输出流强制 UTF-8；内联脚本带 UTF-8 BOM，避免 Windows PowerShell 5.1
+  把脚本内中文按 ANSI 解码乱码
+- 以 Set-PSDebug -Trace 1 运行，日志中会出现 DEBUG: 跟踪行
+- 注入的环境变量同时以 PowerShell 变量形式暴露（$VAR）
+- native 命令失败会传播：脚本末尾追加 exit $LASTEXITCODE 行，最后一条
+  native 命令（go build 等）失败时该 step 判为失败——与 GitHub Actions
+  pwsh 行为一致。纯 cmdlet 脚本与显式 exit 的脚本不受影响
+
+### Docker 执行
+- shell 步骤默认以 "docker run --rm <image> bash -x <script>" 执行；
+  SKA_SHELL 以同样规则覆盖容器内 shell
 
 ## Lua 执行器 (Gopher-Lua)
 使用 gopher-lua 虚拟机在进程内运行 Lua 脚本。向 Lua 暴露以下 API：
@@ -376,7 +485,8 @@ set_env("CUSTOM_VAR", "value")
 
 变量解析：
 - $变量名：从环境变量解析（如 $SKA_BUILD_ID）
-- 裸标识符：从自动检测的 git 上下文解析（branch、commit、git_dirty）
+- 裸标识符：先从 env 解析，其次从自动检测的 git 上下文解析
+  （branch、commit、git_dirty），否则按字面字符串处理
 
 自动注入的 git 上下文变量：
 - branch：    当前 git 分支名（git rev-parse --abbrev-ref HEAD）
@@ -394,6 +504,11 @@ set_env("CUSTOM_VAR", "value")
 
 ## 环境变量
 - SKA_BUILD_ID：自动注入，每个项目从 1 递增。所有 Step 中可用。
+- SKA_BUILD_TIMESTAMP：自动注入，构建开始时刻的 unix 秒（UTC）。
+- SKA_BUILD_DATE：自动注入，RFC3339（UTC）格式的构建日期。
+- SKA_SHELL：可选，通过 step env 设置，覆盖执行 shell（见 Shell 执行器）。
+- step env：在 .skating.yaml 中按 step 定义（default + 平台分组）。
+- --env KEY=VAL（skating run）：用户传入；与 SKA_* 系统变量冲突时用户值优先。
 - 通过 Lua 的 set_env() 可自定义变量。
 
 ## 数据存储
@@ -454,6 +569,6 @@ var Plugin = &SlackPlugin{}
 1. 进入项目目录
 2. 运行：skating init
 3. 编辑 .skating.yaml 定义适合项目的 stages/steps
-4. 运行：skating run <项目名>
-5. 查看结果：skating logs <项目名>
+4. 运行：skating run（项目名可选；不传即使用当前目录）
+5. 查看结果：skating logs
 `

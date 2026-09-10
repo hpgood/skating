@@ -27,13 +27,20 @@
 ### 安装
 
 ```bash
-# 从源码编译（需要 Go 1.21+）
+# 通过 go install 安装（需要 Go 1.25+）
+go install github.com/hpgood/skating/cmd/skating@latest
+
+# 或从源码编译
 git clone https://github.com/hpgood/skating.git
 cd skating
-go build -ldflags="-X main.version=0.2.0" -o skating ./cmd/skating/
+mkdir build
+go build -ldflags="-X main.version=0.2.0" -o build/skating ./cmd/skating/
+
+# 或用 skating 自举编译（读取本仓库的 .skating.yaml 流水线）
+skating run
 
 # 验证
-./skating version
+./build/skating version
 ```
 ```
 skating 0.2.0
@@ -54,7 +61,7 @@ bash scripts/install.sh
 ```bash
 cd /path/to/your/project
 skating init          # 生成 .skating.yaml 配置模板
-skating run myproject # 执行构建
+skating run           # 执行构建（项目名可选 —— 默认当前目录）
 ```
 
 ## 命令
@@ -62,10 +69,11 @@ skating run myproject # 执行构建
 | 命令 | 说明 |
 |------|------|
 | `skating init` | 当前目录初始化项目，生成 `.skating.yaml`、`scripts/` |
-| `skating run <项目>` | 按 Pipeline 编排执行构建 |
-| `skating config <项目>` | 查看项目配置 |
-| `skating logs <项目>` | 查看构建日志（支持 `--last N`、`--id N`） |
-| `skating clean <项目>` | 清空构建日志（保留 BuildID 和项目注册信息） |
+| `skating run <项目>` | 按 Pipeline 编排执行构建（项目名可选 —— 默认当前目录） |
+| `skating update` | 将当前目录 `.skating.yaml` 的 name/image 同步到全局项目注册 |
+| `skating config [项目]` | 查看项目配置（项目名可选 —— 默认当前目录） |
+| `skating logs [项目]` | 查看构建日志（支持 `--last N`、`--id N`；项目名可选 —— 默认当前目录） |
+| `skating clean [项目]` | 清空构建日志（保留 BuildID 和项目注册信息；项目名可选 —— 默认当前目录） |
 | `skating version` | 输出版本号（含 commit 和构建日期） |
 | `skating skill` | 输出 SKILL 指南（供 AI 智能体使用） |
 | `skating ls` | 列出所有已注册项目及构建状态 |
@@ -74,7 +82,7 @@ skating run myproject # 执行构建
 
 ### `skating run` 选项
 
-`run` 命令支持两个 flag 用于选择性子集 / 参数化构建：
+项目名是可选参数：不带参数的 `skating run` 会执行当前目录的 `.skating.yaml`（adhoc 模式）并自动注册项目。此外 `run` 命令支持两个 flag 用于选择性子集 / 参数化构建：
 
 | Flag | 格式 | 说明 |
 |---|---|---|
@@ -118,6 +126,20 @@ skating run myproj --step deploy/release --env DEPLOY_TARGET=canary
 ```
 
 `--env` 格式错误（缺 `=`、KEY 为空）会在任何 step 执行前明确报错。
+
+#### `skating update`
+
+将当前目录 `.skating.yaml` 的 name / image 同步到全局项目注册：
+
+```bash
+cd /path/to/your/project
+skating update
+```
+
+行为：
+- **未注册** → 注册新项目（YAML 未设置 name 时用目录名）
+- **同名项目已存在** → 更新其 `image` 和 `path`
+- **同路径但 YAML 里改了名** → 重命名项目记录
 
 ## 三层架构
 
@@ -192,6 +214,47 @@ log("Build: " .. getenv("SKA_BUILD_ID"))
 sh("docker push myapp:" .. getenv("SKA_BUILD_ID"))
 local ts = getenv("SKA_BUILD_TIMESTAMP")
 log("Unix seconds: " .. ts)
+```
+
+### Step 级环境变量（`env`）
+
+每个 step 可以定义自己的环境变量，按平台分组。`default` 组注入所有平台；其他组（`windows`、`linux`、`darwin`...）仅当组名与当前操作系统（GOOS）一致时注入，平台专属值**优先覆盖** `default` 里的同名变量：
+
+```yaml
+steps:
+  - name: compile
+    type: shell
+    env:
+      default:
+        version: "0.2.1"
+      windows:
+        GOARCH: "amd64"
+        GOOS: "windows"
+        Ext: ".exe"
+      linux:
+        GOARCH: "amd64"
+        GOOS: "linux"
+        Ext: ""
+    script: |
+      go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
+```
+
+### 用 `SKA_SHELL` 指定脚本执行方式
+
+`shell` step 默认使用的 shell：
+
+| 平台 | 默认 shell | 实际执行命令 |
+|---|---|---|
+| Windows | `powershell` | `powershell -ExecutionPolicy Bypass -File <script>` |
+| Linux / macOS | `bash` | `bash -x <script>` |
+
+通过 `SKA_SHELL` 环境变量（写在 step 的 `env` 里，或命令行 `--env` 传入）可以为 step 的 `script` 指定其他 shell。值按空格分割：第一个是 shell 可执行文件，其余作为参数，脚本路径会自动追加：
+
+```yaml
+env:
+  default:
+    SKA_SHELL: "pwsh -NoLogo"
+# 实际执行: pwsh -NoLogo <script>
 ```
 
 ## 数据存储

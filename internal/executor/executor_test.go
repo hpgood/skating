@@ -2,6 +2,7 @@ package executor
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -22,7 +23,7 @@ func TestRunner_ExecuteShell_InlineScript(t *testing.T) {
 		Type:   "shell",
 		Script: "echo hello-from-shell",
 	}
-	out, err := r.Execute(step, t.TempDir(), nil)
+	out, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -38,7 +39,7 @@ func TestRunner_ExecuteShell_EnvInjection(t *testing.T) {
 		Type:   "shell",
 		Script: "echo MY_VAR=$MY_VAR",
 	}
-	out, err := r.Execute(step, t.TempDir(), map[string]string{"MY_VAR": "injected"})
+	out, err := r.Execute(step, t.TempDir(), map[string]string{"MY_VAR": "injected"}, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -54,7 +55,7 @@ func TestRunner_ExecuteShell_FailureReturnsError(t *testing.T) {
 		Type:   "shell",
 		Script: "exit 42",
 	}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error from exit 42")
 	}
@@ -63,15 +64,52 @@ func TestRunner_ExecuteShell_FailureReturnsError(t *testing.T) {
 	}
 }
 
+func TestRunner_ExecuteShell_NativeCommandFailurePropagates(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("powershell-specific behavior")
+	}
+	r := NewRunner()
+	step := Step{
+		Name:   "native-fail",
+		Type:   "shell",
+		Script: "cmd /c exit 7",
+	}
+	if _, err := r.Execute(step, t.TempDir(), nil, nil); err == nil {
+		t.Fatal("expected native command failure to propagate via exit $LASTEXITCODE")
+	}
+}
+
+func TestRunner_ExecuteShell_PureCmdletStillSucceeds(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("powershell-specific behavior")
+	}
+	r := NewRunner()
+	step := Step{
+		Name:   "cmdlet-ok",
+		Type:   "shell",
+		Script: "Write-Output cmdlet-ok",
+	}
+	if _, err := r.Execute(step, t.TempDir(), nil, nil); err != nil {
+		t.Fatalf("pure cmdlet script should still pass: %v", err)
+	}
+}
+
 func TestRunner_ExecuteShell_WorkdirIsHonored(t *testing.T) {
 	r := NewRunner()
 	dir := t.TempDir()
+	var script string
+	if runtime.GOOS == "windows" {
+		// PowerShell 的 pwd/$PWD 走 Format-Table 会截断长路径，改用字符串输出
+		script = "Write-Output (Get-Location).Path"
+	} else {
+		script = "pwd"
+	}
 	step := Step{
 		Name:   "pwd",
 		Type:   "shell",
-		Script: "pwd",
+		Script: script,
 	}
-	out, err := r.Execute(step, dir, nil)
+	out, err := r.Execute(step, dir, nil, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -84,7 +122,7 @@ func TestRunner_ExecuteShell_WorkdirIsHonored(t *testing.T) {
 func TestRunner_ExecuteShell_UnknownType(t *testing.T) {
 	r := NewRunner()
 	step := Step{Name: "x", Type: "python", Script: "pass"}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown step type")
 	}
@@ -97,7 +135,7 @@ func TestRunner_LuaSandbox_DisallowsOs(t *testing.T) {
 		Type:   "lua",
 		Script: `os.execute("echo should-not-run")`,
 	}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error: os module should be disabled in Lua sandbox")
 	}
@@ -110,7 +148,7 @@ func TestRunner_LuaSandbox_DisallowsIo(t *testing.T) {
 		Type:   "lua",
 		Script: `io.open("/etc/passwd", "r")`,
 	}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error: io module should be disabled in Lua sandbox")
 	}
@@ -123,7 +161,7 @@ func TestRunner_LuaSandbox_AllowsPrint(t *testing.T) {
 		Type:   "lua",
 		Script: `print("hello from lua")`,
 	}
-	if _, err := r.Execute(step, t.TempDir(), nil); err != nil {
+	if _, err := r.Execute(step, t.TempDir(), nil, nil); err != nil {
 		t.Errorf("print should work, got: %v", err)
 	}
 }
@@ -134,8 +172,8 @@ func TestRunner_LuaSandbox_ShAPIReusesEnv(t *testing.T) {
 	r := NewRunner()
 	// 通过 set_env 注入，再通过 sh 读取 → 确认 Runner 跨 API 调用复用同一份 env
 	step := Step{
-		Name:   "lua-sh-env",
-		Type:   "lua",
+		Name: "lua-sh-env",
+		Type: "lua",
 		Script: `
 set_env("FROM_LUA_SH", "inherited")
 local out, err = sh("echo FROM_LUA_SH=$FROM_LUA_SH")
@@ -146,7 +184,7 @@ end
 print("LuaShEnvOK")
 `,
 	}
-	out, err := r.Execute(step, t.TempDir(), nil)
+	out, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v\noutput: %q", err, out)
 	}
@@ -162,7 +200,7 @@ func TestRunner_LuaSandbox_ErrorIncludesStepName(t *testing.T) {
 		Type:   "lua",
 		Script: `error("boom")`,
 	}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -191,7 +229,7 @@ func TestRunner_NoDocker_UsesHostShell(t *testing.T) {
 		Type:   "shell",
 		Script: "echo fallback-ok",
 	}
-	out, err := r.Execute(step, t.TempDir(), nil)
+	out, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -203,7 +241,7 @@ func TestRunner_NoDocker_UsesHostShell(t *testing.T) {
 func TestRunner_ExecuteShell_NeitherScriptNorSource(t *testing.T) {
 	r := NewRunner()
 	step := Step{Name: "empty", Type: "shell"}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for empty step")
 	}
@@ -212,7 +250,7 @@ func TestRunner_ExecuteShell_NeitherScriptNorSource(t *testing.T) {
 func TestRunner_ExecuteLua_NeitherScriptNorSource(t *testing.T) {
 	r := NewRunner()
 	step := Step{Name: "empty-lua", Type: "lua"}
-	_, err := r.Execute(step, t.TempDir(), nil)
+	_, err := r.Execute(step, t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for empty lua step")
 	}
@@ -220,13 +258,19 @@ func TestRunner_ExecuteLua_NeitherScriptNorSource(t *testing.T) {
 
 func TestRunner_ExecuteShell_SourceFile(t *testing.T) {
 	dir := t.TempDir()
+	// Windows 用 PowerShell 执行，要求 .ps1 扩展名；脚本语法也按平台切换
 	scriptPath := dir + "/script.sh"
-	if err := writeFile(scriptPath, "#!/bin/bash\necho from-source\n"); err != nil {
+	content := "#!/bin/bash\necho from-source\n"
+	if runtime.GOOS == "windows" {
+		scriptPath = dir + "/script.ps1"
+		content = "Write-Output \"from-source\"\n"
+	}
+	if err := writeFile(scriptPath, content); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 	r := NewRunner()
 	step := Step{Name: "src", Type: "shell", Source: scriptPath}
-	out, err := r.Execute(step, dir, nil)
+	out, err := r.Execute(step, dir, nil, nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

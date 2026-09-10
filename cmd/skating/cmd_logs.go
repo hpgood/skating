@@ -15,9 +15,9 @@ var logLast int
 var logID int
 
 var logsCmd = &cobra.Command{
-	Use:   "logs <project-name>",
+	Use:   "logs [project-name]",
 	Short: i18n.T("查看日志", "View logs"),
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runLogs,
 }
 
@@ -27,7 +27,7 @@ func init() {
 }
 
 func runLogs(cmd *cobra.Command, args []string) error {
-	projName := args[0]
+	projName := resolveProjectName(args)
 
 	s, err := store.NewStore()
 	if err != nil {

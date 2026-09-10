@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hpgood/skating/internal/executor"
@@ -29,9 +31,9 @@ var (
 )
 
 var runCmd = &cobra.Command{
-	Use:   "run <project-name>",
+	Use:   "run [project-name]",
 	Short: i18n.T("运行构建", "Run a build"),
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runRun,
 }
 
@@ -41,7 +43,27 @@ func init() {
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
-	projName := args[0]
+	var projName string
+	var projPath string
+	isAdHoc := len(args) == 0
+
+	if isAdHoc {
+		var err error
+		projPath, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf(i18n.T("获取当前目录失败: %w", "get current directory failed: %w"), err)
+		}
+		configPath := filepath.Join(projPath, ".skating.yaml")
+		if _, err := os.Stat(configPath); os.IsNotExist(err) {
+			return errors.New(i18n.T("当前目录没有 .skating.yaml 配置文件，请先执行 skating init", "no .skating.yaml found in current directory, run skating init first"))
+		}
+		projName = readProjectName(configPath)
+		if projName == "" {
+			projName = filepath.Base(projPath)
+		}
+	} else {
+		projName = args[0]
+	}
 
 	s, err := store.NewStore()
 	if err != nil {
@@ -50,7 +72,20 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	project, err := s.GetProject(projName)
 	if err != nil {
-		return fmt.Errorf(i18n.T("项目 %q 不存在", "project %q not found"), projName)
+		if isAdHoc {
+			project = &store.Project{
+				Name:      projName,
+				Path:      projPath,
+				CreatedAt: time.Now().Format(time.RFC3339),
+			}
+			if err := s.SaveProject(project); err != nil {
+				return fmt.Errorf(i18n.T("自动注册项目失败: %w", "auto-register project failed: %w"), err)
+			}
+		} else {
+			return fmt.Errorf(i18n.T("项目 %q 不存在", "project %q not found"), projName)
+		}
+	} else if isAdHoc {
+		project.Path = projPath
 	}
 
 	configPath := filepath.Join(project.Path, ".skating.yaml")
@@ -72,7 +107,8 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 
-	fmt.Printf(i18n.T("=== 构建项目: %s (Build #%d) ===\n", "=== Build: %s (Build #%d) ===\n"), projName, buildID)
+	fmt.Printf(i18n.T("skating 版本: %s\n", "skating version: %s\n"), version)
+	fmt.Println(executor.ColorTitle(fmt.Sprintf(i18n.T("=== 构建项目: %s (Build #%d) ===", "=== Build: %s (Build #%d) ==="), projName, buildID)))
 	if image != "" {
 		fmt.Printf(i18n.T("Docker 镜像: %s\n", "Docker image: %s\n"), image)
 	}
@@ -99,16 +135,23 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 日志收集：同时输出到终端和缓冲区
+	// 日志收集：同时输出到终端和缓冲区。
+	// 并行 step 的流式行输出会并发调用 logFn，需加锁保护 logBuf。
 	var logBuf bytes.Buffer
+	var logMu sync.Mutex
 	logFn := func(msg string) {
+		logMu.Lock()
+		defer logMu.Unlock()
 		fmt.Println(msg)
-		logBuf.WriteString(msg)
+		// 日志文件/插件拿到的内容去掉 ANSI 颜色序列，保持纯文本
+		logBuf.WriteString(executor.StripANSI(msg))
 		logBuf.WriteString("\n")
 	}
 
 	// 创建适配器：将 executor.Runner 适配到 pipeline.Executor 接口
 	runner := executor.NewRunnerWithImage(image)
+	// shell 输出按行实时流式转发到 logFn
+
 	defer runner.CloseLua()
 
 	if image != "" && !runner.IsDockerAvailable() {
@@ -131,9 +174,9 @@ func runRun(cmd *cobra.Command, args []string) error {
 	overallStatus := "success"
 	if runErr != nil {
 		overallStatus = "failure"
-		fmt.Printf(i18n.T("=== 构建失败: %v ===\n", "=== Build FAILED: %v ===\n"), runErr)
+		fmt.Println(executor.ColorFail(fmt.Sprintf(i18n.T("=== 构建失败: %v ===", "=== Build FAILED: %v ==="), runErr)))
 	} else {
-		fmt.Println(i18n.T("=== 构建完成: success ===", "=== Build SUCCESS ==="))
+		fmt.Println(executor.ColorSuccess(i18n.T("=== 构建完成: success ===", "=== Build SUCCESS ===")))
 	}
 
 	// 7. 保存日志
@@ -188,20 +231,37 @@ func readImage(configPath string) string {
 	return ""
 }
 
+func readProjectName(configPath string) string {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "name:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
+			val = strings.Trim(val, `"'`)
+			return val
+		}
+	}
+	return ""
+}
+
 // executorAdapter 将 executor.Runner 适配到 pipeline.Executor 接口
 type executorAdapter struct {
 	runner  *executor.Runner
 	workDir string
 }
 
-func (a *executorAdapter) Execute(step pipeline.Step, env map[string]string) (string, error) {
+func (a *executorAdapter) Execute(step pipeline.Step, env map[string]string, logFn func(msg string)) (string, error) {
 	es := executor.Step{
 		Name:   step.Name,
 		Type:   step.Type,
 		Script: step.Script,
 		Source: step.Source,
 	}
-	return a.runner.Execute(es, a.workDir, env)
+	return a.runner.Execute(es, a.workDir, env, logFn)
 }
 
 // printSummary 打印构建摘要
@@ -210,15 +270,18 @@ func printSummary(results []*pipeline.PipelineResult, elapsed time.Duration) {
 		return
 	}
 
-	fmt.Println(i18n.T("--- 构建摘要 ---", "--- Build Summary ---"))
+	fmt.Println(executor.ColorSubtitle(i18n.T("--- 构建摘要 ---", "--- Build Summary ---")))
 	for _, r := range results {
 		icon := "✓"
+		statusColor := executor.ColorSuccess
 		if r.Status == "failed" {
 			icon = "✗"
+			statusColor = executor.ColorFail
 		} else if r.Status == "skipped" {
 			icon = "○"
+			statusColor = executor.ColorWarn
 		}
-		fmt.Printf("  [%s/%s] %s %s (%s)\n", r.StageName, r.StepName, icon, r.Status, r.Duration)
+		fmt.Println(statusColor(fmt.Sprintf("  [%s/%s] %s %s (%s)", r.StageName, r.StepName, icon, r.Status, r.Duration)))
 	}
 	fmt.Printf(i18n.T("\n总耗时: %s\n", "\nTotal time: %s\n"), elapsed.Truncate(time.Millisecond))
 }

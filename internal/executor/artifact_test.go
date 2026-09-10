@@ -17,8 +17,10 @@ func TestRunner_SaveArtifact_ToHostBucket(t *testing.T) {
 	}
 
 	// 重定向 home 到 t.TempDir，让 saveArtifact 写到隔离目录
+	// （Windows 的 os.UserHomeDir 读 USERPROFILE，Unix 读 HOME，两个都要设）
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
 	// 重新调用 SaveLog 不会受影响；我们要的是 saveArtifact 用 homeDir
 
 	dest, err := r.saveArtifact(srcPath)
@@ -51,6 +53,7 @@ func TestRunner_SaveArtifact_BucketedByDockerImage(t *testing.T) {
 
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
 
 	dest, err := r.saveArtifact(srcPath)
 	if err != nil {

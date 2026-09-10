@@ -9,7 +9,7 @@ import (
 )
 
 // runLua 执行 Lua 脚本
-func (r *Runner) runLua(step Step, workDir string, env map[string]string) (string, error) {
+func (r *Runner) runLua(step Step, workDir string, env map[string]string, logFn func(string)) (string, error) {
 	L, err := r.getLuaState()
 	if err != nil {
 		return "", err
@@ -17,7 +17,7 @@ func (r *Runner) runLua(step Step, workDir string, env map[string]string) (strin
 
 	// 注册安全 API（每次执行刷新 env 引用）
 	// 传入父 Runner 引用和 workDir，使 Lua 调用的 sh() 能复用
-	r.registerLuaAPI(L, env, workDir)
+	r.registerLuaAPI(L, env, workDir, logFn)
 
 	// 加载并执行 Lua 代码
 	var luaCode string
@@ -39,6 +39,9 @@ func (r *Runner) runLua(step Step, workDir string, env map[string]string) (strin
 		}
 		printBuf.WriteString(strings.Join(parts, "\t"))
 		printBuf.WriteString("\n")
+		if logFn != nil {
+			logFn(strings.Join(parts, "\t"))
+		}
 		return 0
 	}))
 	defer L.SetGlobal("print", L.NewFunction(luaPrintOriginal))
@@ -106,7 +109,7 @@ func (r *Runner) CloseLua() {
 
 // registerLuaAPI 向 Lua 虚拟机注册安全的 Go API
 // parentWorkDir 来自父步骤的工作目录；Lua sh() 内部调用时复用，避免 workdir 丢失
-func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWorkDir string) {
+func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWorkDir string, logFn func(msg string)) {
 	// sh(command) - 执行 shell 命令，复用父 Runner 配置
 	L.SetGlobal("sh", L.NewFunction(func(L *lua.LState) int {
 		command := L.CheckString(1)
@@ -117,7 +120,7 @@ func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWork
 			Type:   "shell",
 			Script: command,
 		}
-		out, err := r.runShell(step, parentWorkDir, env)
+		out, err := r.runShell(step, parentWorkDir, env, logFn)
 		if err != nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString(fmt.Sprintf("sh error: %v\n%s", err, out)))
@@ -131,9 +134,9 @@ func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWork
 	// log(message) - 输出日志
 	L.SetGlobal("log", L.NewFunction(func(L *lua.LState) int {
 		message := L.CheckString(1)
-		if r.logFn != nil {
-			r.logFn(message)
-		}
+
+		logFn(message)
+
 		fmt.Print(message)
 		return 0
 	}))

@@ -29,13 +29,21 @@ A lightweight CI/CD automation tool — Jenkins-like power, single binary simpli
 ### Installation
 
 ```bash
-# Build from source (requires Go 1.21+)
+# Install via go install (requires Go 1.25+)
+go install github.com/hpgood/skating/cmd/skating@latest
+
+# Or build from source
 git clone https://github.com/hpgood/skating.git
 cd skating
-go build -ldflags="-X main.version=0.2.0" -o skating ./cmd/skating/
+mkdir build
+go build -ldflags="-X main.version=0.2.0" -o build/skating ./cmd/skating/
+
+# Or build with skating itself (reads the .skating.yaml pipeline in this repo)
+skating run
 
 # Verify
-./skating version
+./build/skating version
+
 ```
 ```
 skating 0.2.0
@@ -55,7 +63,7 @@ bash scripts/install.sh
 ```bash
 cd /path/to/your/project
 skating init          # Generates .skating.yaml template
-skating run myproject # Run the build
+skating run           # Run the build (project name is optional — defaults to current directory)
 ```
 
 ## Commands
@@ -63,10 +71,11 @@ skating run myproject # Run the build
 | Command | Description |
 |---------|-------------|
 | `skating init` | Initialize a project with `.skating.yaml` and `scripts/` |
-| `skating run <project>` | Execute the pipeline build |
-| `skating config <project>` | View project configuration |
-| `skating logs <project>` | View build logs (`--last N`, `--id N`) |
-| `skating clean <project>` | Clear build logs (keeps BuildID and registry) |
+| `skating run <project>` | Execute the pipeline build (project name optional — defaults to current directory) |
+| `skating update` | Sync name/image from the current `.skating.yaml` to the project registry |
+| `skating config [project]` | View project configuration (name optional — defaults to current directory) |
+| `skating logs [project]` | View build logs (`--last N`, `--id N`; name optional — defaults to current directory) |
+| `skating clean [project]` | Clear build logs (keeps BuildID and registry; name optional — defaults to current directory) |
 | `skating version` | Print version (commit, build date) |
 | `skating skill` | Output SKILL guide for AI agents |
 | `skating ls` | List all registered projects and their status |
@@ -75,7 +84,7 @@ All commands support `--lang zh-CN` for Chinese output.
 
 ### `skating run` options
 
-The `run` command supports two flags for selective / parameterized builds:
+The project name is optional: `skating run` with no argument runs the `.skating.yaml` in the current directory (ad-hoc mode) and auto-registers the project. The command also supports two flags for selective / parameterized builds:
 
 | Flag | Format | Description |
 |---|---|---|
@@ -119,6 +128,20 @@ skating run myproj --step deploy/release --env DEPLOY_TARGET=canary
 ```
 
 Malformed `--env` values (missing `=`, empty KEY) produce a clear error before any step runs.
+
+#### `skating update`
+
+Syncs the current directory's `.skating.yaml` (name / image) into the global project registry:
+
+```bash
+cd /path/to/your/project
+skating update
+```
+
+Behavior:
+- **Not registered** → registers the project (name defaults to the directory name if not set in YAML)
+- **Same name exists** → updates its `image` and `path`
+- **Same path, renamed in YAML** → renames the project record
 
 ## Three-Layer Architecture
 
@@ -193,6 +216,47 @@ log("Build: " .. getenv("SKA_BUILD_ID"))
 sh("docker push myapp:" .. getenv("SKA_BUILD_ID"))
 local ts = getenv("SKA_BUILD_TIMESTAMP")
 log("Unix seconds: " .. ts)
+```
+
+### Step Environment (`env`)
+
+Each step can define its own environment variables, grouped per platform. The `default` group applies everywhere; other groups (`windows`, `linux`, `darwin`, ...) are injected only when the key matches the current OS, and platform-specific values **override** same-named `default` values:
+
+```yaml
+steps:
+  - name: compile
+    type: shell
+    env:
+      default:
+        version: "0.2.1"
+      windows:
+        GOARCH: "amd64"
+        GOOS: "windows"
+        Ext: ".exe"
+      linux:
+        GOARCH: "amd64"
+        GOOS: "linux"
+        Ext: ""
+    script: |
+      go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
+```
+
+### Custom Shell with `SKA_SHELL`
+
+By default each `shell` step runs with:
+
+| Platform | Default shell | Effective command |
+|---|---|---|
+| Windows | `powershell` | `powershell -ExecutionPolicy Bypass -File <script>` |
+| Linux / macOS | `bash` | `bash -x <script>` |
+
+Set the `SKA_SHELL` env var (in the step's `env`, or via `--env` on the command line) to choose another shell for a step's `script`. The value is split by spaces: the first token is the shell executable, the rest are passed as arguments, and the script path is appended automatically:
+
+```yaml
+env:
+  default:
+    SKA_SHELL: "pwsh -NoLogo"
+# effective: pwsh -NoLogo <script>
 ```
 
 ## Data Storage

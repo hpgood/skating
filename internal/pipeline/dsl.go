@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"maps"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -9,11 +10,30 @@ import (
 
 // Step 表示 pipeline 中的一个执行步骤
 type Step struct {
-	Name   string `yaml:"name"`
-	Type   string `yaml:"type"`   // shell 或 lua
-	Script string `yaml:"script"` // 内联脚本
-	Source string `yaml:"source"` // 外部脚本路径
-	When   string `yaml:"when"`   // 条件表达式
+	Name   string                       `yaml:"name"`
+	Type   string                       `yaml:"type"`   // shell 或 lua
+	Script string                       `yaml:"script"` // 内联脚本
+	Source string                       `yaml:"source"` // 外部脚本路径
+	When   string                       `yaml:"when"`   // 条件表达式
+	Env    map[string]map[string]string `yaml:"env"`    // 环境变量（按平台分组）
+}
+
+// ResolveEnv 按平台解析 step 级环境变量。
+// 分组键约定：default 注入所有平台；其余键（windows/linux/darwin 等）
+// 仅在键名等于 goos 时注入。平台专属变量优先覆盖 default 中的同名变量。
+// goos 由调用方传入（通常为 runtime.GOOS），便于测试。
+// 未命中任何变量时返回 nil。
+func (s Step) ResolveEnv(goos string) map[string]string {
+	if len(s.Env) == 0 {
+		return nil
+	}
+	merged := make(map[string]string)
+	maps.Copy(merged, s.Env["default"])
+	maps.Copy(merged, s.Env[goos])
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 // Stage 表示 pipeline 中的一个阶段

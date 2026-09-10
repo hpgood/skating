@@ -23,10 +23,9 @@ type Executor interface {
 
 // Runner 是 Executor 的具体实现
 type Runner struct {
-	logFn           func(string) // Lua log 回调函数
-	luaState        *lua.LState  // 保留复用的 Lua 虚拟机
-	dockerImage     string       // .skating.yaml 的 image 字段，空则不启用 Docker
-	dockerAvailable bool         // host 是否检测到 docker CLI
+	luaState        *lua.LState // 保留复用的 Lua 虚拟机
+	dockerImage     string      // .skating.yaml 的 image 字段，空则不启用 Docker
+	dockerAvailable bool        // host 是否检测到 docker CLI
 }
 
 // NewRunner 创建一个新的 Runner，并检测 Docker 可用性
@@ -62,12 +61,12 @@ func (r *Runner) DockerImage() string {
 }
 
 // Execute 根据 step.Type 分发到对应的执行器
-func (r *Runner) Execute(step Step, workDir string, env map[string]string) (string, error) {
+func (r *Runner) Execute(step Step, workDir string, env map[string]string, logFn func(msg string)) (string, error) {
 	switch step.Type {
 	case "shell":
-		return r.runShell(step, workDir, env)
+		return r.runShell(step, workDir, env, logFn)
 	case "lua":
-		return r.runLua(step, workDir, env)
+		return r.runLua(step, workDir, env, logFn)
 	default:
 		return "", fmt.Errorf("unknown step type: %q", step.Type)
 	}
