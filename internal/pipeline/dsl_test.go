@@ -9,7 +9,6 @@ import (
 func TestLoadPipeline_ValidConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfg := `name: demo
-image: golang:1.21
 pipeline:
   stages:
     - name: build
@@ -42,7 +41,6 @@ pipeline:
 func TestLoadPipeline_NoStages(t *testing.T) {
 	dir := t.TempDir()
 	cfg := `name: demo
-image: golang:1.21
 `
 	if err := os.WriteFile(filepath.Join(dir, ".skating.yaml"), []byte(cfg), 0644); err != nil {
 		t.Fatalf("write: %v", err)
@@ -65,7 +63,6 @@ func TestLoadPipeline_InvalidYAML(t *testing.T) {
 	dir := t.TempDir()
 	// 顶层 steps 而不是 pipeline.stages — 这是之前 init 模板的 bug
 	cfg := `name: demo
-image: golang:1.21
 steps:
   - name: build
     type: shell

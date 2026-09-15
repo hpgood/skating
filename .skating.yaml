@@ -1,9 +1,15 @@
 name: "skating"
-image: ""
 pipeline:
   stages:
     - name: build
       parallel: false
+      env:
+        default:
+          version: "0.2.1"
+        windows:
+          Ext: ".exe"
+        linux:
+          Ext: ""
       steps:
         - name: compile
           type: shell
@@ -24,4 +30,18 @@ pipeline:
             echo "Building with SKA_BUILD_ID=${SKA_BUILD_ID}"
             echo "Ext=${Ext}"
             echo "GOOS=${GOOS}"
-            go build -ldflags="-X main.version=${version} -X main.date=${SKA_BUILD_DATE}" -o "build/skating${Ext}" ./cmd/skating 
+            echo "SKA_GIT_COMMIT_ID=${SKA_GIT_COMMIT_ID}"
+            echo "SKA_GIT_BRANCH=${SKA_GIT_BRANCH}"
+            go build -ldflags="-X main.version=${version} -X main.date=${SKA_BUILD_DATE} -X main.commit=${SKA_GIT_COMMIT_ID} -X main.branch=${SKA_GIT_BRANCH}" -o "build/skating${Ext}" ./cmd/skating
+            echo "::set-var output=build/skating${Ext}"
+        - name: finish
+          type: shell
+          when: SKA_OS == windows
+          env:
+            windows:
+              Ext: ".exe"
+          script: |
+            echo "Output: ${output}"
+            cp "${output}" "./skating${Ext}"
+            cp "${output}" "D:/green/bin/skating${Ext}"
+ 

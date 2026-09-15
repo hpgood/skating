@@ -8,17 +8,24 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // runShell 执行 Shell 脚本
-// 若 Runner 配置了 dockerImage 且主机有 docker，则在容器中运行；否则在 host 直接执行。
+// 若本步骤配置了镜像且主机有 docker，则在容器中运行；否则在 host 直接执行。
 func (r *Runner) runShell(step Step, workDir string, env map[string]string, logFn func(msg string)) (string, error) {
-	var cmd *exec.Cmd
-
 	// 优先使用 Docker 容器执行
-	if r.dockerImage != "" && r.dockerAvailable {
-		return r.runShellInDocker(step, workDir, env, logFn)
+	if step.Image != "" && r.dockerAvailable {
+		return r.runShellInDocker(step, workDir, env, logFn, step.Image)
+	}
+
+	// 配置了镜像但 docker 不可用：提示该步骤将回退到 host 执行
+	if step.Image != "" && logFn != nil {
+		logFn(colorize(colorYellow, fmt.Sprintf(
+			"[warn] image %q configured for step %q but docker CLI not found, running on host shell",
+			step.Image, step.Name)))
 	}
 
 	shell := "bash"
@@ -31,6 +38,7 @@ func (r *Runner) runShell(step Step, workDir string, env map[string]string, logF
 	}
 	isPowerShell := isPwsh(shell)
 	color := colorForShell(shell)
+	var cmd *exec.Cmd
 	if step.Script != "" {
 		// 内联脚本：写入临时文件后执行
 		ext := ".sh"
@@ -76,8 +84,8 @@ func (r *Runner) runShell(step Step, workDir string, env map[string]string, logF
 		return "", fmt.Errorf("step %q: neither script nor source specified", step.Name)
 	}
 
-	stdoutW := &lineStreamer{logFn: logFn, color: color}
-	stderrW := &lineStreamer{logFn: logFn, color: color}
+	stdoutW := &lineStreamer{logFn: logFn, color: color, onSetVar: r.onSetVar}
+	stderrW := &lineStreamer{logFn: logFn, color: color, onSetVar: r.onSetVar}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
@@ -97,7 +105,7 @@ func (r *Runner) runShell(step Step, workDir string, env map[string]string, logF
 
 // runShellInDocker 在 Docker 容器内执行 shell 步骤
 // 通过 `docker run --rm` 启动一次性容器，挂载 workDir，注入 env
-func (r *Runner) runShellInDocker(step Step, workDir string, env map[string]string, logFn func(msg string)) (string, error) {
+func (r *Runner) runShellInDocker(step Step, workDir string, env map[string]string, logFn func(msg string), image string) (string, error) {
 	if step.Script == "" && step.Source == "" {
 		return "", fmt.Errorf("step %q: neither script nor source specified", step.Name)
 	}
@@ -132,28 +140,15 @@ func (r *Runner) runShellInDocker(step Step, workDir string, env map[string]stri
 			return "", fmt.Errorf("resolve source path: %w", err)
 		}
 		hostScriptPath = absSource
-		containerScriptPath = "/workdir/" + filepath.Base(absSource)
+		containerScriptPath = dockerWorkDir(step) + "/" + filepath.Base(absSource)
 	}
 	defer tmpFileCleanup()
 
-	// 构建 docker run 命令
-	args := []string{"run", "--rm"}
-
-	// 挂载 workDir 到 /workdir（容器内固定的工程根目录）
-	args = append(args, "-v", fmt.Sprintf("%s:/workdir", absWorkDir))
-	args = append(args, "-w", "/workdir")
-
-	// 内联脚本还需额外挂载
-	if step.Script != "" {
-		args = append(args, "-v", fmt.Sprintf("%s:%s", hostScriptPath, containerScriptPath))
-	}
-
-	// 注入环境变量
-	for k, v := range env {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
-	}
-
-	args = append(args, r.dockerImage)
+	// 容器名唯一化：超时/取消时可通过 docker kill 精确停止本命令启动的容器
+	// （杀掉 docker CLI 客户端进程并不会停止容器本身）
+	containerName := fmt.Sprintf("skating-%d", time.Now().UnixNano())
+	args := buildDockerRunArgs(step, containerName, absWorkDir, hostScriptPath, containerScriptPath, env)
+	args = append(args, image)
 
 	shell := "bash"
 
@@ -170,9 +165,20 @@ func (r *Runner) runShellInDocker(step Step, workDir string, env map[string]stri
 	args = append(args, _args...)
 	args = append(args, containerScriptPath)
 
-	cmd := exec.Command("docker", args...)
-	stdoutW := &lineStreamer{logFn: logFn, color: colorDocker}
-	stderrW := &lineStreamer{logFn: logFn, color: colorDocker}
+	// 打印 docker 执行信息（隐藏 -e 注入的环境变量，避免泄漏敏感值）
+	if logFn != nil {
+		summary := fmt.Sprintf("docker run --rm %s %s %s", strings.Join(step.DockerOptions, " "), image, shell)
+		logFn(colorize(colorDocker, strings.Join(strings.Fields(summary), " ")))
+	}
+
+	cmd := exec.CommandContext(r.ctx, "docker", args...)
+	// 取消时先 docker kill 停容器（比杀 CLI 进程更彻底），再让 run 进程随之退出
+	cmd.Cancel = func() error {
+		_ = exec.Command("docker", "kill", containerName).Run()
+		return nil
+	}
+	stdoutW := &lineStreamer{logFn: logFn, color: colorDocker, onSetVar: r.onSetVar}
+	stderrW := &lineStreamer{logFn: logFn, color: colorDocker, onSetVar: r.onSetVar}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 	err = cmd.Run()
@@ -184,6 +190,46 @@ func (r *Runner) runShellInDocker(step Step, workDir string, env map[string]stri
 		return output, fmt.Errorf("docker shell command failed: %w\n%s", err, output)
 	}
 	return output, nil
+}
+
+// buildDockerRunArgs 构建 docker run 的前置参数（不含镜像名及其后的 shell 部分）。
+// 顺序：内置参数（--name、挂载、-w、-e）→ step.DockerOptions（用户自定义，
+// 可覆盖内置重复 flag）→ 由调用方追加镜像名。
+func buildDockerRunArgs(step Step, containerName, absWorkDir, hostScriptPath, containerScriptPath string, env map[string]string) []string {
+	args := []string{"run", "--rm", "--name", containerName}
+
+	// 挂载 workDir 到容器内工作目录（默认 /work，可由 step.workdir 配置）
+	cwd := dockerWorkDir(step)
+	args = append(args, "-v", fmt.Sprintf("%s:%s", absWorkDir, cwd))
+	args = append(args, "-w", cwd)
+
+	// 内联脚本还需额外挂载
+	if step.Script != "" {
+		args = append(args, "-v", fmt.Sprintf("%s:%s", hostScriptPath, containerScriptPath))
+	}
+
+	// 注入环境变量（按 key 排序保证参数顺序稳定，便于测试）
+	for _, k := range slices.Sorted(maps.Keys(env)) {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
+	}
+
+	// 用户自定义 docker options（如 --network host、-v /tmp/cache:/var/cache）
+	args = append(args, step.DockerOptions...)
+
+	return args
+}
+
+// dockerWorkDir 返回容器内工作目录：step.WorkDir 为空时默认 /work，
+// 不以 / 开头时自动补前缀（如 "cache" 等价 "/cache"）。
+func dockerWorkDir(step Step) string {
+	w := step.WorkDir
+	if w == "" {
+		return "/work"
+	}
+	if !strings.HasPrefix(w, "/") {
+		w = "/" + w
+	}
+	return w
 }
 
 // buildShellCmd 根据操作系统构建 shell 命令
@@ -223,8 +269,17 @@ func (r *Runner) buildShellCmd(scriptPath string, workDir string, env map[string
 		logFn(colorize(colorForShell(shell), shell+" "+strings.Join(args, " ")))
 	}
 
-	cmd = exec.Command(shell, args...)
+	cmd = exec.CommandContext(r.ctx, shell, args...)
 	cmd.Dir = workDir
+
+	// Windows 下 Process.Kill 只杀 shell 本身，其子进程（go build 等）会成为孤儿；
+	// taskkill /T /F 才能终止整棵进程树
+	if runtime.GOOS == "windows" {
+		cmd.Cancel = func() error {
+			_ = exec.Command("taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T", "/F").Run()
+			return nil
+		}
+	}
 
 	// 注入环境变量
 	cmd.Env = os.Environ()
@@ -287,15 +342,17 @@ func isPwsh(shell string) bool {
 // lineStreamer 实现 io.Writer：在累积完整输出的同时，按行实时转发到 logFn。
 // logFn 为 nil 时只累积、不转发（返回值语义与原先完全一致）。
 // color 非空时按对应 shell 的颜色上色后转发（累积的原始输出不受影响）。
+// 输出中的 "::set-var KEY=VALUE" 标记行被捕获为跨 step 变量（不进入
+// 日志与累积输出），其余行照常处理。
 type lineStreamer struct {
-	out     strings.Builder // 完整输出（作为返回值）
-	pending strings.Builder // 尚未凑齐一行的残余内容
-	logFn   func(string)
-	color   string
+	out      strings.Builder // 完整输出（作为返回值）
+	pending  strings.Builder // 尚未凑齐一行的残余内容
+	logFn    func(string)
+	color    string
+	onSetVar func(key, value string)
 }
 
 func (w *lineStreamer) Write(p []byte) (int, error) {
-	w.out.Write(p)
 	w.pending.Write(p)
 	s := w.pending.String()
 	w.pending.Reset()
@@ -304,20 +361,33 @@ func (w *lineStreamer) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		w.emit(strings.TrimSuffix(s[:i], "\r"))
+		w.handleLine(strings.TrimSuffix(s[:i], "\r"))
 		s = s[i+1:]
 	}
 	w.pending.WriteString(s)
 	return len(p), nil
 }
 
-// flush 在命令结束后转发最后一段未换行的残余输出
+// flush 在命令结束后处理最后一段未换行的残余输出
 func (w *lineStreamer) flush() {
 	s := w.pending.String()
 	w.pending.Reset()
 	if s != "" {
-		w.emit(strings.TrimSuffix(s, "\r"))
+		w.handleLine(strings.TrimSuffix(s, "\r"))
 	}
+}
+
+// handleLine 处理一行完整输出：::set-var 标记行被捕获（不进日志与返回值），
+// 其余行累积并转发日志
+func (w *lineStreamer) handleLine(line string) {
+	if k, v, ok := parseSetVarLine(line); ok {
+		if w.onSetVar != nil {
+			w.onSetVar(k, v)
+		}
+		return
+	}
+	w.out.WriteString(line + "\n")
+	w.emit(line)
 }
 
 func (w *lineStreamer) String() string { return w.out.String() }
@@ -326,4 +396,20 @@ func (w *lineStreamer) emit(line string) {
 	if w.logFn != nil {
 		w.logFn(colorize(w.color, line))
 	}
+}
+
+// parseSetVarLine 解析跨 step 变量输出标记："::set-var KEY=VALUE"。
+// 允许行首尾空白；VALUE 可包含 "="；KEY 为空或缺失 "=" 时视为普通输出行。
+func parseSetVarLine(line string) (key, value string, ok bool) {
+	s := strings.TrimSpace(line)
+	const prefix = "::set-var "
+	if !strings.HasPrefix(s, prefix) {
+		return "", "", false
+	}
+	kv := s[len(prefix):]
+	i := strings.IndexByte(kv, '=')
+	if i <= 0 {
+		return "", "", false
+	}
+	return kv[:i], kv[i+1:], true
 }

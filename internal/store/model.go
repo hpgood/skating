@@ -4,7 +4,6 @@ package store
 type Project struct {
 	Name       string `yaml:"name"`
 	Path       string `yaml:"path"`
-	Image      string `yaml:"image"`
 	BuildID    int    `yaml:"buildid"`
 	LastStatus string `yaml:"laststatus"`
 	LastBuild  string `yaml:"lastbuild"`
@@ -18,6 +17,12 @@ type BuildRecord struct {
 	Status      string `yaml:"status"`
 	StartTime   string `yaml:"starttime"`
 	EndTime     string `yaml:"endtime"`
+}
+
+// GlobalConfig 是 ~/.skating/config.yaml 的顶层结构（全局配置）
+type GlobalConfig struct {
+	// MaxTasks 本机同时允许运行的最大任务数（<=0 时按 CPU 核数取默认值）
+	MaxTasks int `yaml:"max_tasks"`
 }
 
 // projectsFile 是 projects.yaml 文件的顶层结构

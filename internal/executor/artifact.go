@@ -7,18 +7,18 @@ import (
 	"path/filepath"
 )
 
-// saveArtifact 把指定路径的文件复制到 ~/.skating/artifacts/<runner-image-or-host>/<basename>
+// saveArtifact 把指定路径的文件复制到 ~/.skating/artifacts/<image-or-host>/<basename>
 // 返回目标绝对路径。文件不存在或读取失败时返回错误。
-// runner 镜像名作为子目录，避免不同项目/镜像的产物混淆。
-func (r *Runner) saveArtifact(srcPath string) (string, error) {
+// 步骤镜像名作为子目录，避免不同项目/镜像的产物混淆；无镜像时归入 host。
+func (r *Runner) saveArtifact(srcPath, image string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("get home: %w", err)
 	}
 
 	bucket := "host"
-	if r.dockerImage != "" {
-		bucket = sanitizePath(r.dockerImage)
+	if image != "" {
+		bucket = sanitizePath(image)
 	}
 
 	artDir := filepath.Join(home, ".skating", "artifacts", bucket)

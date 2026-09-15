@@ -26,10 +26,14 @@ const skillDocEn = `# SKATING SKILL
 
 ## Overview
 Skating is a lightweight CI/CD automation tool. It uses a YAML-based pipeline DSL
-with Shell and Lua executors, and stores all data as local YAML files (no database required).
-When a docker image is configured and docker CLI is available on the host, shell steps
-run inside a one-shot "docker run --rm" container (workdir mounted, env injected).
-Otherwise shell steps fall back to running directly on the host shell.
+with Shell, Lua, SSH and file-transfer (scp/sync) executors, and stores all data
+as local YAML files (no database required).
+When a shell step configures a docker image (step-level "image") and docker CLI is
+available on the host, that step runs inside a one-shot "docker run --rm" container
+(workdir mounted, env injected). Otherwise the step falls back to running directly
+on the host shell. Different steps may use different images. SSH steps run bash
+scripts on a remote server over a native SSH connection. scp/sync steps transfer
+files between local and remote over SFTP (scp semantics / rsync-like sync).
 
 ## Commands
 
@@ -41,8 +45,8 @@ Initialize a skating project in the current directory.
 - Registers the project in global ~/.skating/projects.yaml
 - If .skating.yaml already exists, returns an error; use --force to overwrite
 - The project name is auto-derived from the current directory name
-- The template sets image: "" (steps run on the host shell); set a docker image
-  in .skating.yaml to build inside a container instead
+- Steps run on the host shell by default; set a step-level docker image
+  in .skating.yaml to run that step inside a container instead
 
 ### skating run [project-name]
 Execute the full pipeline. The project name is optional:
@@ -57,10 +61,12 @@ Options:
   on conflict user values override skating system env (SKA_*)
 Workflow:
 1. Load project (registry or ad-hoc) and read .skating.yaml from the project path
-2. Increment and inject SKA_BUILD_ID (plus SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE)
+2. Increment and inject SKA_BUILD_ID (plus SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE,
+   SKA_GIT_COMMIT_ID, SKA_OS); SKA_GIT_BRANCH is refreshed before each step runs
 3. Execute stages sequentially; within a stage with parallel=true, run steps concurrently
-4. For each step: evaluate the When condition (if any), merge step-level env
-   (platform-aware), then dispatch to the shell or lua executor
+4. For each step: evaluate the When condition (if any), merge stage-level env
+   then step-level env (both platform-aware; step overrides stage on conflicts),
+   then dispatch to the shell, lua, ssh, scp or sync executor
 5. Stream output to the terminal line-by-line and buffer it for log persistence
 6. Save log to ~/.skating/logs/<project>/<buildID>.log (plain text, ANSI stripped)
 7. Update project status and timestamp in projects.yaml
@@ -82,14 +88,24 @@ View build logs.
 Clear build log files for a project (defaults to the current directory project).
 BuildID counter and project registry are preserved. --all clears logs for all projects.
 
+### skating secret set/list/delete
+Manage global secrets (ssh passwords / private keys) stored in
+~/.skating/secrets.json (file mode 0600). Secrets are referenced by name from
+pipeline yaml — the yaml never contains the secret value itself.
+- set <name>: store a value. Sources (mutually exclusive): --value <v>,
+  --from-file <path>, or omit both for a hidden terminal prompt (no echo,
+  nothing in shell history). For private keys use --from-file.
+- list: show names and timestamps only (never values)
+- delete <name>: remove a secret
+
 ### skating update
-Sync name/image from the current directory .skating.yaml to the global registry:
+Sync the project name from the current directory .skating.yaml to the global registry:
 - Project not registered yet → register it
-- Same name already registered → update image and path
+- Same name already registered → update path
 - Same path registered under an old name (yaml name changed) → rename the project
 
 ### skating ls
-List all registered projects with their name, path, docker image, last build status, and last build time.
+List all registered projects with their name, path, last build status, and last build time.
 Status values: "success", "failure", "none" (never built).
 
 ### skating version
@@ -103,14 +119,36 @@ Output this SKILL document. Use --lang zh-CN for Chinese.
 ### Full Schema
 ` + "```yaml" + `
 name: project-name          # Project identifier
-image: docker-image:tag     # Docker image for isolated builds (optional; empty = host shell)
 pipeline:
   stages:
     - name: stage-name
       parallel: false       # If true, run all steps in this stage concurrently
+      env:                  # Stage-level env, shared by all steps in the stage
+        default:            # (optional; same grouping rules as step env:
+          version: "0.2.1"  #  stage env < step env on same-name conflict)
+        windows:
+          Ext: ".exe"
       steps:
         - name: step-name
-          type: shell|lua   # Executor type
+          type: shell|lua|ssh|scp|sync  # Executor type
+          image: docker-image:tag  # Optional step-level docker image (shell steps
+                                   # only); empty = run on host shell. Steps may
+                                   # use different images
+          docker_options:          # Extra args appended to "docker run" (optional)
+            - --network host
+          workdir: /work           # Container-side working directory (optional,
+                                   # default /work; only for shell steps with image)
+          host: 10.0.0.1           # SSH/SCP/Sync: remote host (required; supports ${VAR})
+          port: 22                 # SSH/SCP/Sync: remote port (optional, default 22)
+          user: deploy             # SSH/SCP/Sync: login user (required; supports ${VAR})
+          auth: password           # SSH/SCP/Sync: password|key (optional, default password)
+          secret: deploy-pass      # SSH/SCP/Sync: global secret NAME (skating secret
+                                   # set <name>); the value is resolved at runtime
+          direction: push          # SCP only: push (local->remote, default) | pull
+          local: dist/             # SCP/Sync only: local path (supports ${VAR})
+          remote: /opt/app/        # SCP/Sync only: remote path (supports ${VAR})
+          delete: true             # Sync only: remove remote files missing locally
+                                   # (optional, default true)
           script: |         # Inline script content
             echo "hello"
           source: path/script.sh  # External script path (alternative to script)
@@ -126,19 +164,53 @@ pipeline:
 
 ### Step Fields
 - name: (required) Unique step name within the stage
-- type: (required) "shell" or "lua"
+- type: (required) "shell", "lua", "ssh", "scp" or "sync"
 - script: Inline script content. For shell: bash commands. For lua: Lua code.
+  For ssh: bash commands run on the remote server.
 - source: Path to external script file. Mutually exclusive with script (use one).
+- image: (optional, shell steps only) Step-level docker image. When set and the
+  docker CLI is available, the step runs inside a one-shot container; each step
+  may use a different image. Empty = run on host shell.
+- docker_options: (optional, shell steps only) Extra args appended to "docker run",
+  e.g. ["--network host", "-v /tmp/cache:/var/cache"]. Placed after the built-in
+  flags (name, workdir mount, env) and before the image name, so duplicates of
+  built-in flags are overridden by these values.
+- workdir: (optional) For shell steps with image: container-side working directory
+  where the project directory is mounted; default "/work". For ssh steps: remote
+  cd directory (no default, supports ${VAR} expansion). A leading "/" is added
+  automatically for docker (e.g. "cache" becomes "/cache").
 - when: Conditional expression. Step is skipped if false. Empty/absent means always run.
 - env: (optional) Step-level environment variables grouped by platform. Group key
   "default" applies on every platform; other keys (windows/linux/darwin...) apply
   when the key matches the runtime GOOS. Platform groups override same-name
   variables from default.
+- host: (ssh/scp/sync steps only, required) Remote host (IP or domain). Supports
+  ${VAR} expansion (e.g. "10.0.0.${SEG}"); undefined variables are kept as-is.
+- port: (ssh/scp/sync steps only) Remote SSH port; default 22.
+- user: (ssh/scp/sync steps only, required) Remote login user. Supports ${VAR}
+  expansion; undefined variables are kept as-is.
+- auth: (ssh/scp/sync steps only) "password" or "key"; default "password". With
+  "key" the secret holds a PEM private key.
+- secret: (ssh/scp/sync steps only, required) NAME of a global secret created
+  with "skating secret set <name>". The actual password/key is resolved from
+  ~/.skating/secrets.json at runtime — it never appears in the yaml or in logs.
+- direction: (scp steps only) "push" (local -> remote, default) or "pull"
+  (remote -> local).
+- local: (scp/sync steps only, required) Local path. ${VAR} variables are
+  expanded from the step env view (SKA_* system vars, step env, cross-step
+  pool). For sync it must be a directory.
+- remote: (scp/sync steps only, required) Remote path; also ${VAR}-expanded.
+- delete: (sync steps only) Mirror deletion — remove remote files/dirs that no
+  longer exist locally. Default true; set false to only add/update remote files.
 
 ### Stage Fields
 - name: (required) Stage name
 - parallel: (optional, default false) Run all steps concurrently
 - steps: (required) Ordered list of Step objects
+- env: (optional) Stage-level environment variables grouped by platform, shared
+  by every step in the stage (scripts and When conditions both see them).
+  Same grouping rules as step env. Priority: build env (SKA_*, --env) <
+  stage env < step env — same-name variables are overridden by the step env.
 
 ### Step Execution Rules
 - Stages run sequentially; a failing stage stops the entire pipeline
@@ -147,6 +219,34 @@ pipeline:
 - With --step filtering, stages/steps not selected are recorded as skipped (visible
   in the summary); in --step <stage> mode a sequential stage continues past failing
   steps so the whole stage reports, while the overall build stays failed
+
+## Cross-Step Variables
+Steps can pass variables to subsequent steps via a build-level variable pool.
+Variables in the pool are visible to every later step's script environment and
+When condition (pool values override same-name step env keys).
+
+Two ways to write into the pool:
+- Shell and SSH steps: echo a marker line "::set-var KEY=VALUE" to
+  stdout. The line is captured and does NOT appear in the log or step output.
+- Lua steps: call set_env(key, value) — same effect, also visible to later steps.
+
+--env, step env and SKA_* system vars are unaffected; pool variables only
+override same-name keys in the per-step env view.
+
+Examples:
+` + "```yaml" + `
+steps:
+  - name: producer
+    type: shell
+    script: |
+      echo "::set-var VERSION=v1.2.3"
+  - name: consumer
+    type: shell
+    when: "VERSION == v1.2.3"
+    script: |
+      echo "building ${VERSION}"
+` + "```" + `
+Lua equivalent: ` + "```lua" + `set_env("VERSION", "v1.2.3")` + "```" + `
 
 ## Shell Executor
 - Default shell: /bin/bash on Linux/macOS, PowerShell on Windows
@@ -172,8 +272,108 @@ pipeline:
   exit are unaffected.
 
 ### Docker execution
-- Shell steps run via "docker run --rm <image> bash -x <script>" by default;
-  SKA_SHELL overrides the shell inside the container using the same rules
+- Applies only to shell steps that set a step-level "image" (and docker CLI available):
+  "docker run --rm <image> bash -x <script>". SKA_SHELL overrides the shell inside
+  the container using the same rules
+- docker_options entries are appended after the built-in flags and before the image
+  name; a later duplicate flag wins (docker semantics)
+- The project directory is mounted at the container working directory (default
+  "/work", configurable per step via "workdir"; a leading "/" is added automatically)
+
+## SSH Executor
+SSH steps (type: ssh) connect to a remote server with a native SSH client
+(golang.org/x/crypto/ssh) and run the script with remote bash — no local ssh.exe
+or sshpass needed.
+
+Example:
+` + "```yaml" + `
+steps:
+  - name: deploy
+    type: ssh
+    host: 10.0.0.1
+    port: 22
+    user: deploy
+    auth: password
+    secret: deploy-pass
+    workdir: /opt/app
+    script: |
+      ./deploy.sh ${SKA_GIT_BRANCH}
+` + "```" + `
+
+Behavior:
+- Authentication: "password" (default) or "key" (secret holds a PEM private key,
+  stored via skating secret set <name> --from-file <keyfile>)
+- Secrets: the yaml stores only the secret NAME; the value lives in
+  ~/.skating/secrets.json (mode 0600) and is resolved at runtime. Secret values
+  are never logged
+- Host key check: accept-all (InsecureIgnoreHostKey) — suitable for internal
+  servers; the dial timeout is 30s
+- The script is fed to remote "bash -s" via stdin (no command-line length or
+  quoting limits). Step env (SKA_* + step env + cross-step pool) is injected as
+  export lines before the script
+- workdir: the remote runs "cd <workdir>" before the script (supports ${VAR}
+  expansion, e.g. "/opt/${APP}")
+- host/user support ${VAR} expansion from the step env view (SKA_* + step env +
+  cross-step pool); undefined variables are kept as-is, so a typo surfaces at
+  dial time instead of silently connecting to a wrong host
+- stdout/stderr stream line-by-line to the live log (magenta) with ::set-var
+  capture, same as shell steps; a non-zero remote exit code fails the step
+
+## SCP / Sync Executor
+scp (type: scp) copies a file or directory between local and remote over SFTP
+(pkg/sftp) — no scp binary or OpenSSH installation needed. sync (type: sync)
+mirrors a local directory to a remote directory like a simplified rsync:
+unchanged files (same size + mtime, second precision) are skipped, and remote
+files that no longer exist locally are removed. Both reuse the SSH connection
+fields (host/port/user/auth/secret; host/user support ${VAR}) and support
+${VAR} expansion in local and remote paths.
+
+Examples:
+` + "```yaml" + `
+steps:
+  - name: upload-artifact
+    type: scp                       # push (local -> remote), the default
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist/app-${SKA_GIT_BRANCH}.tar.gz
+    remote: /opt/app/app.tar.gz
+
+  - name: fetch-logs
+    type: scp
+    direction: pull                 # pull: remote -> local
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: logs/
+    remote: /var/log/myapp
+
+  - name: sync-dist
+    type: sync                      # incremental mirror upload with deletion
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist
+    remote: /opt/app/dist
+    delete: true                    # default; set false to keep extra remote files
+` + "```" + `
+
+Behavior:
+- scp: single file or recursive directory; remote parent directories are
+  created automatically and mtimes are preserved (so a follow-up sync skips
+  unchanged files). The log gets a summary line
+  "[scp] push local ↔ remote: N file(s), SIZE"
+- scp pull: the remote path may be a file or a directory (downloaded
+  recursively)
+- sync: local must be a directory. On first deploy the remote directory may
+  not exist yet (treated as empty). Files are compared by size + mtime
+  (second precision); changed files are uploaded with mtime preserved. After
+  upload, remote entries missing locally are removed when delete is true
+  (the default)
+- sync writes a summary line
+  "[sync] local → remote: uploaded N, skipped N, removed N (SIZE)"
+- Authentication, secret resolution, host key policy, 30s dial timeout and
+  build-context cancellation behave exactly as in SSH steps
 
 ## Lua Executor (Gopher-Lua)
 Runs Lua scripts in-process using the gopher-lua VM. The following APIs are exposed to Lua:
@@ -198,7 +398,7 @@ set_env("CUSTOM_VAR", "value")
 ` + "```" + `
 
 ### upload_artifact(path) -> (dest_path, error)
-Copy a local file to ~/.skating/artifacts/<docker-image-or-host>/<basename>.
+Copy a local file to ~/.skating/artifacts/<step-image-or-host>/<basename>.
 Returns the destination absolute path on success, or empty string + error message on failure.
 ` + "`" + `path` + "`" + ` may be an absolute path or relative to the current step's working directory.
 
@@ -233,10 +433,18 @@ Examples:
 - SKA_BUILD_ID: Auto-injected, increments from 1 per project. Available in all steps.
 - SKA_BUILD_TIMESTAMP: Auto-injected, unix seconds (UTC) of the build start time.
 - SKA_BUILD_DATE: Auto-injected, RFC3339 (UTC) human-readable build date.
+- SKA_GIT_COMMIT_ID: Auto-injected, current git commit id (full hash from
+  git rev-parse HEAD) of the project; empty when the project has no .git.
+- SKA_GIT_BRANCH: Auto-injected, current git branch name (git rev-parse
+  --abbrev-ref HEAD), refreshed right before each step runs; not set when
+  the project has no .git.
+- SKA_OS: Auto-injected, runtime operating system (runtime.GOOS):
+  linux / windows / darwin / ...
 - SKA_SHELL: Optional, set via step env, overrides the executing shell (see Shell Executor).
 - Step env: defined per step in .skating.yaml (default + platform groups).
 - --env KEY=VAL (skating run): user-provided; overrides SKA_* system values on conflict.
-- User-defined via set_env() in Lua scripts.
+- User-defined via set_env() in Lua scripts (current step + later steps, see
+  Cross-Step Variables).
 
 ## Data Storage
 All data under ~/.skating/:
@@ -246,7 +454,6 @@ All data under ~/.skating/:
 projects:
   - name: myproject
     path: /absolute/path/to/project
-    image: golang:1.21
     buildid: 5
     laststatus: success
     lastbuild: "2024-01-15T10:30:00Z"
@@ -254,6 +461,9 @@ projects:
 ` + "```" + `
 
 ~/.skating/logs/<project>/<N>.log   Plain text build logs, one file per build ID.
+
+~/.skating/secrets.json             Global secrets (ssh passwords / private keys),
+                                    file mode 0600. Managed by skating secret set/list/delete.
 
 ## Plugins (Yaegi)
 - Builtin ConsoleNotifier prints build result summary after each build
@@ -304,10 +514,13 @@ const skillDocZhCN = `# SKATING SKILL（中文）
 
 ## 概述
 Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水线 DSL，
-配合 Shell 和 Lua 执行器，所有数据以本地 YAML 文件存储（无需数据库）。
-当 .skating.yaml 配置了 docker 镜像且主机上存在 docker CLI 时，shell 步骤
-会在一次性 "docker run --rm" 容器内运行（挂载工作目录、注入环境变量）；
-否则回退到直接在 host shell 执行。
+配合 Shell、Lua、SSH 与文件传输（scp/sync）执行器，所有数据以本地 YAML
+文件存储（无需数据库）。
+当 shell 步骤配置了 step 级 docker 镜像（"image"）且主机上存在 docker CLI 时，
+该步骤会在一次性 "docker run --rm" 容器内运行（挂载工作目录、注入环境变量）；
+否则直接在 host shell 执行。不同步骤可以使用不同镜像。SSH 步骤通过原生 SSH
+连接在远程服务器上执行 bash 脚本。scp/sync 步骤通过 SFTP 在本地与远端之间
+传输文件（scp 语义 / rsync 式同步）。
 
 ## 命令
 
@@ -319,8 +532,8 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 - 将项目注册到全局 ~/.skating/projects.yaml
 - 如果 .skating.yaml 已存在，返回错误；使用 --force 强制覆盖
 - 项目名自动取当前目录名
-- 模板 image 为 ""（步骤直接在 host shell 执行）；在 .skating.yaml 设置
-  docker 镜像可改为容器内构建
+- 步骤默认在 host shell 执行；在 .skating.yaml 中为 step 设置 docker 镜像
+  可改为容器内执行
 
 ### skating run [项目名]
 执行项目的完整流水线。项目名可选：
@@ -334,10 +547,12 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
   与系统 SKA_* 变量冲突时用户值优先
 工作流：
 1. 加载项目（注册表或 adhoc），从项目路径读取 .skating.yaml
-2. 递增并注入 SKA_BUILD_ID（同时注入 SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE）
+2. 递增并注入 SKA_BUILD_ID（同时注入 SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE / SKA_GIT_COMMIT_ID / SKA_OS）；
+   SKA_GIT_BRANCH 在每个 step 运行前刷新注入
 3. 按顺序执行各 Stage；若 Stage 设置 parallel=true，则并发执行其中的 Steps
-4. 对每个 Step：先评估 When 条件（如有），再合并 step 级 env（按平台解析），
-   最后分发到 shell 或 lua 执行器
+4. 对每个 Step：先评估 When 条件（如有），再合并 stage 级 env 与 step 级 env
+   （均按平台解析；同名变量 step 覆盖 stage），
+   最后分发到 shell、lua、ssh、scp 或 sync 执行器
 5. 输出按行实时流式转发到终端，同时缓冲用于日志持久化
 6. 将日志保存到 ~/.skating/logs/<项目名>/<buildID>.log（纯文本，已剥离 ANSI）
 7. 更新 projects.yaml 中的项目状态和时间戳
@@ -358,14 +573,23 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 清空项目的构建日志文件（默认当前目录对应的项目）。BuildID 计数器和项目注册信息保持不变。
 --all 清空所有项目的日志。
 
+### skating secret set/list/delete
+管理全局 secret（SSH 密码/私钥），存储在 ~/.skating/secrets.json（文件权限
+0600）。流水线 yaml 通过名字引用 secret——yaml 中永远不出现 secret 的值本身。
+- set <name>：存储一个值。来源（互斥）：--value <v>、--from-file <path>，
+  或两者都省略以使用隐藏式终端输入（不回显、不进 shell history）。
+  私钥请用 --from-file
+- list：仅显示名字和时间戳（从不显示值）
+- delete <name>：删除一个 secret
+
 ### skating update
-将当前目录 .skating.yaml 的 name/image 同步到全局注册表：
+将当前目录 .skating.yaml 的 name 同步到全局注册表：
 - 项目未注册 → 注册新项目
-- 同名项目已注册 → 更新 image 与 path
+- 同名项目已注册 → 更新 path
 - 同路径记录存在但名字不匹配（yaml 里改过名）→ 重命名项目
 
 ### skating ls
-列出所有已注册项目的名称、路径、Docker 镜像、最近构建状态和最近构建时间。
+列出所有已注册项目的名称、路径、最近构建状态和最近构建时间。
 状态值："success"（成功）、"failure"（失败）、"none"（从未构建）。
 
 ### skating version
@@ -379,14 +603,36 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 ### 完整 Schema
 ` + "```yaml" + `
 name: project-name          # 项目标识
-image: docker-image:tag     # Docker 镜像（可选；为空则直接在 host shell 执行）
 pipeline:
   stages:
     - name: stage-name
       parallel: false       # 若为 true，该 Stage 内的 Steps 并发执行
+      env:                  # stage 级环境变量，该 Stage 内所有 Steps 共享
+        default:            # （可选；分组规则与 step env 相同：
+          version: "0.2.1"  #  同名变量 step 覆盖 stage）
+        windows:
+          Ext: ".exe"
       steps:
         - name: step-name
-          type: shell|lua   # 执行器类型
+          type: shell|lua|ssh|scp|sync  # 执行器类型
+          image: docker-image:tag  # 可选的 step 级 docker 镜像（仅对 shell 步骤
+                                   # 生效）；为空则在 host shell 执行。不同步骤
+                                   # 可使用不同镜像
+          docker_options:          # 追加到 "docker run" 的额外参数（可选）
+            - --network host
+          workdir: /work           # 容器内工作目录（可选，默认 /work；
+                                   # 仅对配置了 image 的 shell 步骤生效）
+          host: 10.0.0.1           # SSH/SCP/Sync：远端主机（必填；支持 ${VAR}）
+          port: 22                 # SSH/SCP/Sync：远端端口（可选，默认 22）
+          user: deploy             # SSH/SCP/Sync：登录用户（必填；支持 ${VAR}）
+          auth: password           # SSH/SCP/Sync：password|key（可选，默认 password）
+          secret: deploy-pass      # SSH/SCP/Sync：全局 secret 名（skating secret
+                                   # set <name> 创建）；运行时 resolve 其值
+          direction: push          # 仅 SCP：push（本地→远端，默认）| pull
+          local: dist/             # 仅 SCP/Sync：本地路径（支持 ${VAR}）
+          remote: /opt/app/        # 仅 SCP/Sync：远端路径（支持 ${VAR}）
+          delete: true             # 仅 Sync：删除本地已不存在的远端文件
+                                   # （可选，默认 true）
           script: |         # 内联脚本内容
             echo "hello"
           source: path/script.sh  # 外部脚本路径（与 script 二选一）
@@ -402,18 +648,47 @@ pipeline:
 
 ### Step 字段说明
 - name：（必填）Stage 内唯一的 Step 名称
-- type：（必填）"shell" 或 "lua"
-- script：内联脚本内容。shell 类型为 bash 命令，lua 类型为 Lua 代码
+- type：（必填）"shell"、"lua"、"ssh"、"scp" 或 "sync"
+- script：内联脚本内容。shell 类型为 bash 命令，lua 类型为 Lua 代码，
+  ssh 类型为在远端服务器上运行的 bash 命令
 - source：外部脚本文件路径。与 script 互斥（只能使用一个）
+- image：（可选，仅 shell 步骤）step 级 docker 镜像。设置后且 docker CLI 可用
+  时，该步骤在一次性容器内执行；每个步骤可使用不同镜像。为空则在 host shell 执行
+- docker_options：（可选，仅 shell 步骤）追加到 "docker run" 的额外参数，
+  如 ["--network host", "-v /tmp/cache:/var/cache"]。位于内置参数（容器名、
+  workdir 挂载、env）之后、镜像名之前，与内置 flag 重复时以这些值为准
+- workdir：（可选）配置了 image 的 shell 步骤：项目目录挂载到的容器内工作
+  目录，默认 "/work"；SSH 步骤：远端 cd 目录（无默认值，支持 ${VAR} 展开）。
+  docker 场景不以 / 开头时自动补前缀（如 "cache" 等价 "/cache"）
 - when：条件表达式。若为 false 则跳过该 Step。为空或未设置表示始终执行
 - env：（可选）step 级环境变量，按平台分组。分组键 "default" 对所有平台生效；
   其余键（windows/linux/darwin...）仅在键名等于当前 GOOS 时生效；
   平台组覆盖 default 中同名变量
+- host：（仅 ssh/scp/sync 步骤，必填）远端主机（IP 或域名）。支持 ${VAR} 展开
+  （如 "10.0.0.${SEG}"）；未定义变量保留原样
+- port：（仅 ssh/scp/sync 步骤）远端 SSH 端口；默认 22
+- user：（仅 ssh/scp/sync 步骤，必填）登录用户。支持 ${VAR} 展开；
+  未定义变量保留原样
+- auth：（仅 ssh/scp/sync 步骤）"password" 或 "key"；默认 "password"。为 "key" 时
+  secret 存 PEM 私钥
+- secret：（仅 ssh/scp/sync 步骤，必填）全局 secret 名，用 "skating secret set
+  <name>" 创建。真实密码/私钥运行时从 ~/.skating/secrets.json resolve
+  ——yaml 和日志中永远不会出现
+- direction：（仅 scp 步骤）"push"（本地→远端，默认）或 "pull"（远端→本地）
+- local：（仅 scp/sync 步骤，必填）本地路径。支持 ${VAR} 变量展开（取自 step
+  env 视图：SKA_* 系统变量、step env、跨 step 变量池）。sync 要求必须是目录
+- remote：（仅 scp/sync 步骤，必填）远端路径；同样支持 ${VAR} 展开
+- delete：（仅 sync 步骤）镜像删除——移除本地已不存在的远端文件/目录。
+  默认 true；设为 false 则只新增/更新远端文件
 
 ### Stage 字段说明
 - name：（必填）Stage 名称
 - parallel：（可选，默认 false）是否并发执行该 Stage 内的所有 Steps
 - steps：（必填）Step 对象的有序列表
+- env：（可选）stage 级环境变量，按平台分组，该 Stage 内所有 Steps 共享
+  （脚本的 ${VAR} 与 When 条件均可见）。分组规则与 step env 相同。
+  优先级：构建 env（SKA_*、--env）< stage env < step env
+  ——同名变量以 step env 为准
 
 ### 执行规则
 - Stage 按顺序执行；失败的 Stage 会终止整个流水线
@@ -422,6 +697,33 @@ pipeline:
 - 使用 --step 过滤时，未选中的 stage/step 记为 skipped（在摘要中可见）；
   --step <stage> 模式下串行 stage 失败后继续执行剩余 step 以报告完整结果，
   但整体构建状态仍为失败
+
+## 跨 Step 变量
+Step 可以通过构建级变量池向后续 Step 传递变量。池中的变量对之后每个 Step
+的脚本环境与 When 条件可见（池变量覆盖同名的 step env 键）。
+
+两种写入方式：
+- shell 与 SSH 步骤：向 stdout 输出一行标记 "::set-var KEY=VALUE"。
+  该行会被捕获，不会出现在日志与 step 返回输出中
+- lua 步骤：调用 set_env(键, 值)——同样写入变量池，后续 Step 可见
+
+--env、step env 与 SKA_* 系统变量不受影响；池变量仅在每 Step 的 env 视图
+中覆盖同名键。
+
+示例：
+` + "```yaml" + `
+steps:
+  - name: producer
+    type: shell
+    script: |
+      echo "::set-var VERSION=v1.2.3"
+  - name: consumer
+    type: shell
+    when: "VERSION == v1.2.3"
+    script: |
+      echo "building ${VERSION}"
+` + "```" + `
+Lua 等价写法：` + "```lua" + `set_env("VERSION", "v1.2.3")` + "```" + `
 
 ## Shell 执行器
 - 默认 shell：Linux/macOS 为 /bin/bash，Windows 为 PowerShell
@@ -445,8 +747,96 @@ pipeline:
   pwsh 行为一致。纯 cmdlet 脚本与显式 exit 的脚本不受影响
 
 ### Docker 执行
-- shell 步骤默认以 "docker run --rm <image> bash -x <script>" 执行；
-  SKA_SHELL 以同样规则覆盖容器内 shell
+- 仅对配置了 step 级 "image" 的 shell 步骤生效（且 docker CLI 可用）：
+  "docker run --rm <image> bash -x <script>"。SKA_SHELL 以同样规则覆盖容器内 shell
+- docker_options 追加在内置参数之后、镜像名之前；与内置 flag 重复时后者覆盖
+  （docker 语义）
+- 项目目录挂载到容器内工作目录（默认 "/work"，可通过 step.workdir 配置；
+  不以 / 开头时自动补前缀）
+
+## SSH 执行器
+SSH 步骤（type: ssh）使用原生 SSH 客户端（golang.org/x/crypto/ssh）连接远程
+服务器，用远端 bash 运行脚本——无需本地 ssh.exe 或 sshpass。
+
+示例：
+` + "```yaml" + `
+steps:
+  - name: deploy
+    type: ssh
+    host: 10.0.0.1
+    port: 22
+    user: deploy
+    auth: password
+    secret: deploy-pass
+    workdir: /opt/app
+    script: |
+      ./deploy.sh ${SKA_GIT_BRANCH}
+` + "```" + `
+
+行为：
+- 认证："password"（默认）或 "key"（secret 存 PEM 私钥，用
+  skating secret set <name> --from-file <keyfile> 存入）
+- Secret：yaml 只存 secret 名字；值保存在 ~/.skating/secrets.json
+  （0600 权限），运行时 resolve。secret 值永不写入日志
+- Host key 校验：accept-all（InsecureIgnoreHostKey）——适合内网服务器；
+  连接超时 30s
+- 脚本经 stdin 喂给远端 "bash -s"（无命令行长度/引号转义限制）。
+  step env（SKA_* + step env + 跨 step 变量池）以 export 行注入到脚本之前
+- workdir：远端在脚本执行前先 "cd <workdir>"（支持 ${VAR} 展开，如 "/opt/${APP}"）
+- host/user 支持从 step env 视角（SKA_* + step env + 跨 step 变量池）做 ${VAR}
+  展开；未定义变量保留原样，拼错变量名会在连接时暴露原始值，而非静默连错主机
+- stdout/stderr 按行实时转发到实时日志（品红色）并捕获 ::set-var，
+  与 shell 步骤一致；远端非零退出码判定 step 失败
+
+## SCP / Sync 执行器
+scp（type: scp）通过 SFTP（pkg/sftp）在本地与远端之间复制文件或目录——无需
+本地安装 scp 或 OpenSSH。sync（type: sync）把本地目录镜像到远端目录（简化版
+rsync）：未变化文件（size + mtime 秒级一致）自动跳过，本地已不存在的远端文件
+会被删除。两者复用 SSH 连接字段（host/port/user/auth/secret；host/user 支持
+${VAR}），local/remote 均支持 ${VAR} 变量展开。
+
+示例：
+` + "```yaml" + `
+steps:
+  - name: upload-artifact
+    type: scp                       # push（本地→远端），默认方向
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist/app-${SKA_GIT_BRANCH}.tar.gz
+    remote: /opt/app/app.tar.gz
+
+  - name: fetch-logs
+    type: scp
+    direction: pull                 # pull：远端→本地
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: logs/
+    remote: /var/log/myapp
+
+  - name: sync-dist
+    type: sync                      # 增量镜像上传 + 删除多余文件
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist
+    remote: /opt/app/dist
+    delete: true                    # 默认；设为 false 保留远端多余文件
+` + "```" + `
+
+行为：
+- scp：支持单文件或目录（目录递归）；自动创建远端父目录，并保留 mtime
+  （便于后续 sync 增量跳过）。日志输出摘要行
+  "[scp] push local ↔ remote: N file(s), SIZE"
+- scp pull：远端路径可以是文件或目录（目录递归下载）
+- sync：local 必须是目录。首次部署时远端目录可以不存在（视为空树）。
+  文件按 size + mtime（秒级精度）比较，变化的文件上传并保留 mtime。
+  上传完成后，若 delete 为 true（默认），删除远端存在但本地不存在的条目
+- sync 输出摘要行
+  "[sync] local → remote: uploaded N, skipped N, removed N (SIZE)"
+- 认证、secret 解析、host key 策略、30s 连接超时与构建上下文取消
+  与 SSH 步骤完全一致
 
 ## Lua 执行器 (Gopher-Lua)
 使用 gopher-lua 虚拟机在进程内运行 Lua 脚本。向 Lua 暴露以下 API：
@@ -465,13 +855,14 @@ log("开始构建步骤...")
 ` + "```" + `
 
 ### set_env(键, 值)
-在构建上下文中设置环境变量。
+设置环境变量。当前 step 内立即生效（sh()/getenv 可见），同时写入构建级
+变量池，后续 Step（含 When 条件）也能读到。
 ` + "```lua" + `
 set_env("CUSTOM_VAR", "value")
 ` + "```" + `
 
 ### upload_artifact(路径) -> (目标路径, 错误)
-将本地文件复制到 ~/.skating/artifacts/<docker-镜像或-host>/<文件名>。
+将本地文件复制到 ~/.skating/artifacts/<步骤镜像或-host>/<文件名>。
 成功时返回目标绝对路径，失败时返回空字符串 + 错误信息。
 ` + "`" + `路径` + "`" + ` 可以是绝对路径，也可以是相对当前步骤工作目录的相对路径。
 
@@ -506,10 +897,16 @@ set_env("CUSTOM_VAR", "value")
 - SKA_BUILD_ID：自动注入，每个项目从 1 递增。所有 Step 中可用。
 - SKA_BUILD_TIMESTAMP：自动注入，构建开始时刻的 unix 秒（UTC）。
 - SKA_BUILD_DATE：自动注入，RFC3339（UTC）格式的构建日期。
+- SKA_GIT_COMMIT_ID：自动注入，项目当前 git commit id（git rev-parse HEAD 的完整 hash）；
+  项目无 .git 时为空。
+- SKA_GIT_BRANCH：自动注入，当前 git 分支名（git rev-parse --abbrev-ref HEAD），
+  每个 step 运行前刷新；项目无 .git 时不注入。
+- SKA_OS：自动注入，运行时操作系统类型（runtime.GOOS）：
+  linux / windows / darwin 等。
 - SKA_SHELL：可选，通过 step env 设置，覆盖执行 shell（见 Shell 执行器）。
 - step env：在 .skating.yaml 中按 step 定义（default + 平台分组）。
 - --env KEY=VAL（skating run）：用户传入；与 SKA_* 系统变量冲突时用户值优先。
-- 通过 Lua 的 set_env() 可自定义变量。
+- 通过 Lua 的 set_env() 可自定义变量（当前 step + 后续 step 生效，见跨 Step 变量）。
 
 ## 数据存储
 所有数据存储在 ~/.skating/ 下：
@@ -527,6 +924,9 @@ projects:
 ` + "```" + `
 
 ~/.skating/logs/<项目名>/<N>.log   纯文本构建日志，每个构建 ID 一个文件。
+
+~/.skating/secrets.json      全局 secret（SSH 密码/私钥），文件权限 0600，
+                             由 skating secret set/list/delete 管理。
 
 ## 插件系统 (Yaegi)
 - 内置 ConsoleNotifier 在每次构建后打印结果摘要

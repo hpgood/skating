@@ -7,8 +7,9 @@ A lightweight CI/CD automation tool — Jenkins-like power, single binary simpli
 ## Features
 
 - **Zero-dependency deploy** — Single binary, no database, all data in local YAML files
-- **Three-layer architecture** — Pipeline DSL + Shell/Lua executor + Yaegi plugin system
+- **Three-layer architecture** — Pipeline DSL + Shell/Lua/SSH/SCP/Sync executor + Yaegi plugin system
 - **Docker sandbox** — Isolated builds inside containers for consistent environments
+- **Remote deploy** — Native SSH executor plus SFTP-based scp/sync file transfer
 - **Cross-platform** — Windows / Linux / macOS
 
 ## vs Drone
@@ -149,7 +150,7 @@ Behavior:
 ┌─────────────────────────────┐
 │  Pipeline DSL (YAML)        │  ← Stage / Parallel / When orchestration
 ├─────────────────────────────┤
-│  Executor (Shell + Lua)     │  ← Command execution with Lua sandbox
+│  Executor                   │  ← Shell + Lua + SSH/SCP/Sync
 ├─────────────────────────────┤
 │  Plugins (Yaegi)            │  ← Go plugins: notifications, reviewers, etc.
 └─────────────────────────────┘
@@ -203,6 +204,8 @@ Every build automatically injects these environment variables (UTC, derived from
 | `SKA_BUILD_ID`        | integer (string) | `1`           | Auto-incrementing build number (from 1) |
 | `SKA_BUILD_TIMESTAMP` | integer (string) | `1787139682`  | Build start time as **Unix seconds (UTC)** — easy to sort / diff / arithmetic |
 | `SKA_BUILD_DATE`      | string           | `2026-08-19T11:41:22Z` | Build start time as **RFC3339 (UTC)** — human-readable, for reports/logs |
+| `SKA_GIT_COMMIT_ID`   | string           | `9a2c1f0d...` | Current git commit id (**full hash**) of the project; empty if the project has no `.git` |
+| `SKA_OS`              | string           | `linux`       | Runtime operating system (`runtime.GOOS`): `linux`, `windows`, `darwin`, ... |
 
 Shell scripts:
 ```bash
@@ -241,6 +244,29 @@ steps:
       go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
 ```
 
+### Stage Environment (`env`)
+
+A stage can also define `env`, shared by **all steps inside the stage** (same platform grouping rules as step env). Priority on same-name conflicts: build env (`SKA_*`, `--env`) < stage env < step env:
+
+```yaml
+stages:
+  - name: build
+    env:                 # shared by every step in this stage
+      default:
+        version: "0.2.1"
+      windows:
+        Ext: ".exe"
+      linux:
+        Ext: ""
+    steps:
+      - name: compile
+        type: shell
+        script: |
+          go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
+```
+
+Stage env variables are visible to scripts (`${VAR}`) and to `when` conditions.
+
 ### Custom Shell with `SKA_SHELL`
 
 By default each `shell` step runs with:
@@ -258,6 +284,64 @@ env:
     SKA_SHELL: "pwsh -NoLogo"
 # effective: pwsh -NoLogo <script>
 ```
+
+## Remote Execution & File Transfer (SSH / SCP / Sync)
+
+Steps can run on remote servers and move files between local and remote.
+All three types reuse the same connection fields (`host` / `port` / `user` /
+`auth` / `secret`) and are powered by a native Go SSH implementation
+(`golang.org/x/crypto/ssh`) — no local ssh.exe, sshpass or scp binary needed.
+
+Secrets are referenced by name (stored with `skating secret set <name>`,
+password or PEM private key); the value never appears in the yaml or logs.
+
+```yaml
+steps:
+  # 1) Run commands on a remote server
+  - name: remote-build
+    type: ssh
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass          # password (default) or "key" auth
+    workdir: /opt/app
+    script: |
+      ./deploy.sh ${SKA_GIT_BRANCH}
+
+  # 2) scp: copy a file/dir local -> remote (push, the default) or back (pull)
+  - name: upload-artifact
+    type: scp
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist/app-${SKA_GIT_BRANCH}.tar.gz
+    remote: /opt/app/app.tar.gz
+
+  # 3) sync: rsync-like incremental mirror of a local directory
+  - name: sync-dist
+    type: sync
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist
+    remote: /opt/app/dist
+    delete: true                 # default: remove remote files missing locally
+```
+
+Behavior notes:
+- `scp` supports both directions: `direction: push` (local -> remote, default)
+  and `direction: pull` (remote -> local). Files and directories are copied
+  recursively; mtimes are preserved so a follow-up `sync` can skip unchanged
+  files.
+- `sync` uploads only changed files (compared by size + mtime, second
+  precision), and by default mirrors the local directory by deleting remote
+  files that no longer exist locally. On first deploy the remote directory may
+  not exist yet.
+- `local` / `remote` support `${VAR}` expansion from the step env view
+  (`SKA_*` system vars, step env, cross-step variable pool). `host`, `user`
+  and `workdir` (ssh) support `${VAR}` too (e.g. `host: 10.0.0.${SEG}`) —
+  undefined variables are kept as-is, so a typo surfaces at dial time instead
+  of silently targeting a wrong host.
+- Build cancellation / timeout closes the SSH connection automatically.
 
 ## Data Storage
 

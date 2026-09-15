@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +18,7 @@ import (
 	"github.com/hpgood/skating/internal/i18n"
 	"github.com/hpgood/skating/internal/pipeline"
 	"github.com/hpgood/skating/internal/plugin"
+	"github.com/hpgood/skating/internal/runstate"
 	"github.com/hpgood/skating/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -89,12 +94,11 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 
 	configPath := filepath.Join(project.Path, ".skating.yaml")
-	pl, err := pipeline.LoadPipeline(configPath)
+	cfg, err := pipeline.LoadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf(i18n.T("加载 pipeline 配置失败: %w", "load pipeline config failed: %w"), err)
 	}
-
-	image := readImage(configPath)
+	pl := &pipeline.Pipeline{Stages: cfg.Pipeline.Stages}
 
 	buildID, err := s.NextBuildID(projName)
 	if err != nil {
@@ -102,26 +106,25 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 	// NextBuildID 已将 BuildID 持久化到磁盘，同步本地 project 副本避免后续 SaveProject 覆盖回旧值
 	project.BuildID = buildID
-	// 同步 image 字段到 store，保证 `skating ls` 显示最新镜像
-	project.Image = image
 
 	startTime := time.Now()
 
 	fmt.Printf(i18n.T("skating 版本: %s\n", "skating version: %s\n"), version)
 	fmt.Println(executor.ColorTitle(fmt.Sprintf(i18n.T("=== 构建项目: %s (Build #%d) ===", "=== Build: %s (Build #%d) ==="), projName, buildID)))
-	if image != "" {
-		fmt.Printf(i18n.T("Docker 镜像: %s\n", "Docker image: %s\n"), image)
-	}
 	fmt.Println()
 
 	// 4. 准备环境变量
 	// SKA_BUILD_TIMESTAMP: 整数 unix 秒 (UTC, 自 epoch 起). 用于排序/diff/算耗时
 	// SKA_BUILD_DATE:      RFC3339 字符串 (UTC), 人类可读日期
 	// 用户脚本需要本地时区可基于 SKA_BUILD_TIMESTAMP 自行换算
+	// SKA_GIT_COMMIT_ID:   项目当前 git commit id (完整 hash); 项目无 .git 时为空
+	// SKA_OS:              运行时操作系统类型 (runtime.GOOS), 如 linux / windows / darwin
 	env := map[string]string{
 		"SKA_BUILD_ID":        fmt.Sprintf("%d", buildID),
 		"SKA_BUILD_TIMESTAMP": fmt.Sprintf("%d", startTime.Unix()),
 		"SKA_BUILD_DATE":      startTime.UTC().Format(time.RFC3339),
+		"SKA_GIT_COMMIT_ID":   gitCommitID(project.Path),
+		"SKA_OS":              runtime.GOOS,
 	}
 
 	// 解析 --step 过滤参数。先验证 stage/step 都存在，再交给 runner。
@@ -134,6 +137,68 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if err := injectUserEnv(env, runUserEnv); err != nil {
 		return err
 	}
+
+	// ---- 运行超时：.skating.yaml 的 timeout 字段，缺省 10m ----
+	timeout := cfg.Timeout.Or(pipeline.DefaultTimeout)
+
+	// ---- 并发闸门 + 运行状态记录（bbolt）----
+	gc, err := s.GetGlobalConfig()
+	if err != nil {
+		return fmt.Errorf(i18n.T("读取全局配置失败: %w", "load global config failed: %w"), err)
+	}
+	tracker, err := runstate.Open(projName, buildID)
+	if err != nil {
+		return fmt.Errorf(i18n.T("创建运行状态追踪失败: %w", "create runstate tracker failed: %w"), err)
+	}
+	if err := tracker.Acquire(gc.MaxTasks); err != nil {
+		if runstate.IsConcurrencyError(err) {
+			ce := err.(*runstate.ConcurrencyError)
+			return fmt.Errorf(i18n.T(
+				"本机并发任务已达上限 (%d/%d)，请等待其他任务完成，或调整 ~/.skating/config.yaml 的 max_tasks",
+				"local concurrent task limit reached (%d/%d), wait for other tasks to finish, or adjust max_tasks in ~/.skating/config.yaml"),
+				ce.Running, ce.Limit)
+		}
+		return fmt.Errorf(i18n.T("占用并发槽位失败: %w", "acquire concurrency slot failed: %w"), err)
+	}
+	tracker.StartHeartbeat()
+
+	// pipeline 执行结束后写入终态；只有整体状态确定时才写（success 时顺带更新耗时预估基准）
+	var overallStatus string
+	defer func() {
+		if overallStatus == "" {
+			return
+		}
+		if err := tracker.Finish(overallStatus); err != nil {
+			fmt.Fprintf(os.Stderr, i18n.T("警告: 写入运行终态失败: %v\n", "Warning: write run final state failed: %v\n"), err)
+		}
+	}()
+
+	fmt.Printf(i18n.T("超时限制: %s\n", "Timeout: %s\n"), timeout)
+	if exp := tracker.ExpectedEnd(); !exp.IsZero() {
+		fmt.Printf(i18n.T("预计结束: %s（基于上次成功构建耗时）\n", "Expected end: %s (based on last successful build)\n"), exp.Format("15:04:05"))
+	}
+
+	// 总 step 数：按 --step 过滤后实际会执行的 step 数（供进度展示）
+	totalSteps := 0
+	for _, stage := range pl.Stages {
+		if runOpts != nil && runOpts.StageName != "" && stage.Name != runOpts.StageName {
+			continue
+		}
+		if runOpts != nil && runOpts.StepName != "" {
+			for _, st := range stage.Steps {
+				if st.Name == runOpts.StepName {
+					totalSteps++
+				}
+			}
+		} else {
+			totalSteps += len(stage.Steps)
+		}
+	}
+	tracker.SetTotalSteps(totalSteps)
+
+	// 超时控制：ctx 取消后 executor 内部的 shell/docker 子进程会被终止
+	runCtx, cancelRun := context.WithTimeout(context.Background(), timeout)
+	defer cancelRun()
 
 	// 日志收集：同时输出到终端和缓冲区。
 	// 并行 step 的流式行输出会并发调用 logFn，需加锁保护 logBuf。
@@ -149,34 +214,88 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 
 	// 创建适配器：将 executor.Runner 适配到 pipeline.Executor 接口
-	runner := executor.NewRunnerWithImage(image)
+	runner := executor.NewRunner()
 	// shell 输出按行实时流式转发到 logFn
+	// 注入超时 ctx：取消后 executor 内部终止 shell/docker 子进程
+	runner.WithContext(runCtx)
+	// 跨 step 变量池：脚本 echo "::set-var KEY=VALUE" 或 Lua set_env 写入，
+	// 后续 step 的 env 与 When 条件自动可见
+	vars := pipeline.NewVarPool()
+	runner.OnSetVar(vars.Set)
 
 	defer runner.CloseLua()
 
-	if image != "" && !runner.IsDockerAvailable() {
-		fmt.Fprintf(os.Stderr, i18n.T("警告: 配置了 Docker 镜像 %q 但 host 未检测到 docker 命令，将使用 host shell 执行。\n",
-			"Warning: Docker image %q configured but `docker` CLI not found, falling back to host shell.\n"), image)
+	// 有 step 配置了镜像但 docker 不可用时提前提示
+	anyImage, hasDocker := false, runner.IsDockerAvailable()
+	for _, stage := range pl.Stages {
+		for _, st := range stage.Steps {
+			if st.Image != "" {
+				anyImage = true
+			}
+		}
+	}
+	if anyImage && !hasDocker {
+		fmt.Fprint(os.Stderr, i18n.T("警告: 有步骤配置了 Docker 镜像但 host 未检测到 docker 命令，相关步骤将使用 host shell 执行。\n",
+			"Warning: some steps configure Docker images but `docker` CLI not found, those steps fall back to host shell.\n"))
 	}
 
-	adapter := &executorAdapter{
-		runner:  runner,
-		workDir: project.Path,
+	adapter := &progressAdapter{
+		inner:   &executorAdapter{runner: runner, workDir: project.Path, secrets: s},
+		tracker: tracker,
 	}
 
-	// 5. 执行流水线
-	results, runErr := pipeline.RunPipeline(pl, adapter, env, logFn, runOpts)
+	// 5. 执行流水线（goroutine + select，支持超时中断）
+	type runOutcome struct {
+		results []*pipeline.PipelineResult
+		err     error
+	}
+	outcomeCh := make(chan runOutcome, 1)
+	go func() {
+		res, err := pipeline.RunPipeline(pl, adapter, env, logFn, runOpts, vars)
+		outcomeCh <- runOutcome{results: res, err: err}
+	}()
+
+	var results []*pipeline.PipelineResult
+	var runErr error
+	timedOut := false
+	select {
+	case oc := <-outcomeCh:
+		results, runErr = oc.results, oc.err
+	case <-runCtx.Done():
+		timedOut = true
+		fmt.Println(executor.ColorFail(fmt.Sprintf(
+			i18n.T("=== 构建超时: 超过 %s，正在终止子进程... ===", "=== Build TIMEOUT: exceeded %s, terminating subprocesses... ==="),
+			timeout)))
+		// 子进程已随 runCtx 取消被终止，等待 pipeline goroutine 退出
+		graceCtx, cancelGrace := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelGrace()
+		select {
+		case oc := <-outcomeCh:
+			results, runErr = oc.results, oc.err
+		case <-graceCtx.Done():
+			runErr = fmt.Errorf("pipeline did not exit after timeout")
+		}
+	}
 
 	elapsed := time.Since(startTime)
 
 	// 6. 确定整体状态
 	fmt.Println()
-	overallStatus := "success"
-	if runErr != nil {
+	switch {
+	case timedOut:
+		overallStatus = "timeout"
+	case runErr != nil:
 		overallStatus = "failure"
-		fmt.Println(executor.ColorFail(fmt.Sprintf(i18n.T("=== 构建失败: %v ===", "=== Build FAILED: %v ==="), runErr)))
-	} else {
+	default:
+		overallStatus = "success"
+	}
+	switch overallStatus {
+	case "success":
 		fmt.Println(executor.ColorSuccess(i18n.T("=== 构建完成: success ===", "=== Build SUCCESS ===")))
+	case "timeout":
+		fmt.Println(executor.ColorFail(i18n.T("=== 构建超时: timeout ===", "=== Build TIMEOUT ===")))
+	default:
+		fmt.Println(executor.ColorFail(fmt.Sprintf(i18n.T("=== 构建失败: %v ===", "=== Build FAILED: %v ==="), runErr)))
 	}
 
 	// 7. 保存日志
@@ -208,29 +327,29 @@ func runRun(cmd *cobra.Command, args []string) error {
 	})
 
 	if runErr != nil {
+		if timedOut {
+			return fmt.Errorf(i18n.T("构建超时（超过 %s），已强制终止", "build timed out (exceeded %s) and was terminated"), timeout)
+		}
 		return runErr
 	}
 	return nil
 }
 
-// readImage 从 .skating.yaml 中解析 image 字段
-func readImage(configPath string) string {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return ""
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "image:") {
-			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "image:"))
-			val = strings.Trim(val, `"'`)
-			return val
-		}
-	}
-	return ""
+// progressAdapter 包装 pipeline.Executor，把 step 的开始/完成事件同步到 runstate.Tracker，
+// 由心跳定期落盘 bbolt，供 skating stats 展示实时进度
+type progressAdapter struct {
+	inner   pipeline.Executor
+	tracker *runstate.Tracker
 }
 
+func (a *progressAdapter) Execute(step pipeline.Step, env map[string]string, logFn func(string)) (string, error) {
+	a.tracker.StepStart(step.StageName, step.Name)
+	out, err := a.inner.Execute(step, env, logFn)
+	a.tracker.StepDone()
+	return out, err
+}
+
+// readProjectName 从 .skating.yaml 中解析 name 字段
 func readProjectName(configPath string) string {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -248,20 +367,104 @@ func readProjectName(configPath string) string {
 	return ""
 }
 
+// gitCommitID 返回项目目录当前的 git commit id（完整 hash）。
+// 项目不存在 .git（目录，或 worktree 场景下的 .git 指针文件）时返回空字符串，不视为错误。
+func gitCommitID(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return ""
+	}
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitBranch 返回项目目录当前的 git 分支名（git rev-parse --abbrev-ref HEAD）。
+// 非 git 目录或命令失败时返回空字符串，不视为错误。
+func gitBranch(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return ""
+	}
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // executorAdapter 将 executor.Runner 适配到 pipeline.Executor 接口
 type executorAdapter struct {
 	runner  *executor.Runner
 	workDir string
+	// secrets 全局 secret 存储：ssh 步骤的 secret 字段是名字，
+	// 执行前在这里 resolve 出真实密码/私钥，不落 yaml、不进日志
+	secrets *store.Store
 }
 
 func (a *executorAdapter) Execute(step pipeline.Step, env map[string]string, logFn func(msg string)) (string, error) {
-	es := executor.Step{
-		Name:   step.Name,
-		Type:   step.Type,
-		Script: step.Script,
-		Source: step.Source,
+	// SKA_GIT_BRANCH：每个 step 运行前实时查询当前分支，保证切分支后立即生效。
+	// 克隆 env 避免污染共享 map（并行 stage 下多个 step 并发读取同一 map）；
+	// 用户通过 --env 显式注入的同名变量优先，系统不覆盖；非 git 目录不注入。
+	stepEnv := env
+	if _, userSet := env["SKA_GIT_BRANCH"]; !userSet {
+		if branch := gitBranch(a.workDir); branch != "" {
+			stepEnv = maps.Clone(env)
+			stepEnv["SKA_GIT_BRANCH"] = branch
+		}
 	}
-	return a.runner.Execute(es, a.workDir, env, logFn)
+	es := executor.Step{
+		Name:          step.Name,
+		Type:          step.Type,
+		Script:        step.Script,
+		Source:        step.Source,
+		Image:         step.Image,
+		DockerOptions: step.DockerOptions,
+		WorkDir:       step.WorkDir,
+		Host:          step.Host,
+		Port:          step.Port,
+		User:          step.User,
+		Auth:          step.Auth,
+		Direction:     step.Direction,
+		Local:         step.Local,
+		Remote:        step.Remote,
+		Delete:        step.Delete,
+	}
+	// ssh/scp/sync 步骤：把 yaml 中的 secret 名字 resolve 成真实认证材料。
+	// 失败时直接让 step 失败，错误信息只含 secret 名，不泄露值
+	if step.Type == "ssh" || step.Type == "scp" || step.Type == "sync" {
+		val, err := a.resolveSecret(step.Name, step.Secret)
+		if err != nil {
+			return "", err
+		}
+		es.Secret = val
+	}
+	return a.runner.Execute(es, a.workDir, stepEnv, logFn)
+}
+
+// resolveSecret 从全局 secret 存储读取 ssh 认证材料
+func (a *executorAdapter) resolveSecret(stepName, secretName string) (string, error) {
+	if secretName == "" {
+		return "", fmt.Errorf("step %q: ssh secret is required (skating secret set <name>, then set secret: <name> in yaml)", stepName)
+	}
+	if a.secrets == nil {
+		return "", fmt.Errorf("step %q: secret store unavailable", stepName)
+	}
+	val, err := a.secrets.GetSecret(secretName)
+	if err != nil {
+		return "", fmt.Errorf("step %q: resolve secret %q: %w", stepName, secretName, err)
+	}
+	return val, nil
 }
 
 // printSummary 打印构建摘要

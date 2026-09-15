@@ -36,7 +36,9 @@ type RunOptions struct {
 // 遇到任一步骤失败则停止后续步骤。
 // logFn 用于实时输出日志。
 // opts 可选：传 nil 等价于 RunOptions{}（运行完整 pipeline）。
-func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(string), opts *RunOptions) ([]*PipelineResult, error) {
+// vars 可选：构建级共享变量池，承载脚本经 "::set-var" 输出标记或 Lua set_env
+// 传递给后续 step 的变量（脚本环境变量与 When 条件均可见）；传 nil 表示不启用。
+func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(string), opts *RunOptions, vars *VarPool) ([]*PipelineResult, error) {
 	if opts == nil {
 		opts = &RunOptions{}
 	}
@@ -60,7 +62,7 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 			continue
 		}
 
-		stageResults, err := runStage(stage, exec, env, logFn, opts)
+		stageResults, err := runStage(stage, exec, env, logFn, opts, vars)
 		results = append(results, stageResults...)
 		if err != nil {
 			// step-filter 模式：让剩下的 stage 至少以 skipped 形式出现，
@@ -81,7 +83,16 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 	return results, firstErr
 }
 
-func runStage(stage Stage, exec Executor, env map[string]string, logFn func(string), opts *RunOptions) ([]*PipelineResult, error) {
+func runStage(stage Stage, exec Executor, env map[string]string, logFn func(string), opts *RunOptions, vars *VarPool) ([]*PipelineResult, error) {
+	// 合并 stage 级 env（default + 当前平台组）到本 stage 的 base env：
+	// stage 内所有 step 共享，When 条件同样可见。
+	// 优先级：构建 env < stage env < step env；克隆避免污染共享构建 env。
+	if m := stage.ResolveEnv(runtime.GOOS); len(m) > 0 {
+		base := maps.Clone(env)
+		maps.Copy(base, m)
+		env = base
+	}
+
 	// step 级过滤：在原 stage 上做"投影"——只保留匹配的 step，其余记为 skipped
 	if opts.StepName != "" {
 		var projected Stage = stage
@@ -114,9 +125,9 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 		var err error
 		var innerResults []*PipelineResult
 		if projected.Parallel {
-			innerResults, err = runParallelInner(projected, exec, env, logFn)
+			innerResults, err = runParallelInner(projected, exec, env, logFn, vars)
 		} else {
-			innerResults, err = runSequentialInner(projected, exec, env, logFn)
+			innerResults, err = runSequentialInner(projected, exec, env, logFn, vars)
 		}
 		stageResults = append(stageResults, innerResults...)
 		return stageResults, err
@@ -126,24 +137,24 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 	// 让 stage 内 sequential step 失败后继续执行剩余 step，
 	// 这样 --step <stage> 能完整跑完 stage。
 	if opts.StageName != "" && !stage.Parallel {
-		innerResults, err := runSequentialContinueOnError(stage, exec, env, logFn)
+		innerResults, err := runSequentialContinueOnError(stage, exec, env, logFn, vars)
 		return innerResults, err
 	}
 
 	if stage.Parallel {
-		return runParallel(stage, exec, env, logFn)
+		return runParallel(stage, exec, env, logFn, vars)
 	}
-	return runSequential(stage, exec, env, logFn)
+	return runSequential(stage, exec, env, logFn, vars)
 }
 
-func runSequential(stage Stage, exec Executor, env map[string]string, logFn func(string)) ([]*PipelineResult, error) {
-	return runSequentialInner(stage, exec, env, logFn)
+func runSequential(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
+	return runSequentialInner(stage, exec, env, logFn, vars)
 }
 
-func runSequentialInner(stage Stage, exec Executor, env map[string]string, logFn func(string)) ([]*PipelineResult, error) {
+func runSequentialInner(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
 	var results []*PipelineResult
 	for _, step := range stage.Steps {
-		result := executeStep(stage.Name, step, exec, env, logFn) // logFn 原样透传到 executeStep
+		result := executeStep(stage.Name, step, exec, env, logFn, vars) // logFn 原样透传到 executeStep
 		results = append(results, result)
 		if result.Status == "failed" {
 			return results, fmt.Errorf("step %q failed: %s", step.Name, result.Error)
@@ -155,11 +166,11 @@ func runSequentialInner(stage Stage, exec Executor, env map[string]string, logFn
 // runSequentialContinueOnError 用于 --step <stage> 模式：sequential stage 内
 // 一个 step 失败后仍继续执行剩余 step（让用户看到整个 stage 完整结果）。
 // 整体返回的 err 会保留第一个失败的 error 给上层做 status 决策。
-func runSequentialContinueOnError(stage Stage, exec Executor, env map[string]string, logFn func(string)) ([]*PipelineResult, error) {
+func runSequentialContinueOnError(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
 	var results []*PipelineResult
 	var firstErr error
 	for _, step := range stage.Steps {
-		result := executeStep(stage.Name, step, exec, env, logFn)
+		result := executeStep(stage.Name, step, exec, env, logFn, vars)
 		results = append(results, result)
 		if result.Status == "failed" && firstErr == nil {
 			firstErr = fmt.Errorf("step %q failed: %s", step.Name, result.Error)
@@ -168,11 +179,11 @@ func runSequentialContinueOnError(stage Stage, exec Executor, env map[string]str
 	return results, firstErr
 }
 
-func runParallel(stage Stage, exec Executor, env map[string]string, logFn func(string)) ([]*PipelineResult, error) {
-	return runParallelInner(stage, exec, env, logFn)
+func runParallel(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
+	return runParallelInner(stage, exec, env, logFn, vars)
 }
 
-func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn func(string)) ([]*PipelineResult, error) {
+func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
 	results := make([]*PipelineResult, len(stage.Steps))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -182,7 +193,7 @@ func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn f
 		wg.Add(1)
 		go func(idx int, step Step) {
 			defer wg.Done()
-			result := executeStep(stage.Name, step, exec, env, logFn)
+			result := executeStep(stage.Name, step, exec, env, logFn, vars)
 			mu.Lock()
 			results[idx] = result
 			if result.Status == "failed" && firstErr == nil {
@@ -196,7 +207,11 @@ func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn f
 	return results, firstErr
 }
 
-func executeStep(stageName string, step Step, exec Executor, env map[string]string, logFn func(string)) *PipelineResult {
+func executeStep(stageName string, step Step, exec Executor, env map[string]string, logFn func(string), vars *VarPool) *PipelineResult {
+	// 合并构建级共享变量（::set-var / Lua set_env 传入）到本 step 的 env 视图：
+	// 池为空时原样返回（不克隆）。后续 When 条件与脚本均可见，且不污染共享 env。
+	env = vars.Merged(env)
+
 	result := &PipelineResult{
 		StageName: stageName,
 		StepName:  step.Name,
@@ -236,6 +251,9 @@ func executeStep(stageName string, step Step, exec Executor, env map[string]stri
 		stepEnv = maps.Clone(env)
 		maps.Copy(stepEnv, m)
 	}
+
+	// 填充所属 stage 名，供上层 Executor 适配器做进度上报
+	step.StageName = stageName
 
 	start := time.Now()
 	output, err := exec.Execute(step, stepEnv, logFn)

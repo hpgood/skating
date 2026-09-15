@@ -78,7 +78,7 @@ func TestRunPipeline_SerialStage_StopsOnFailure(t *testing.T) {
 		},
 	}
 
-	results, err := RunPipeline(p, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {}, nil)
+	results, err := RunPipeline(p, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {}, nil, nil)
 	if err == nil {
 		t.Fatal("expected error from failed step")
 	}
@@ -118,7 +118,7 @@ func TestRunPipeline_ParallelStage_RunsConcurrently(t *testing.T) {
 		},
 	}
 
-	_, err := RunPipeline(p, exec, nil, func(s string) {}, nil)
+	_, err := RunPipeline(p, exec, nil, func(s string) {}, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestRunPipeline_ParallelStage_RunsConcurrently(t *testing.T) {
 func TestExecuteStep_WhenConditionSkips(t *testing.T) {
 	exec := newFakeExecutor()
 	step := Step{Name: "test", Type: "shell", When: "SKA_BUILD_ID == 99"}
-	result := executeStep("stage", step, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {})
+	result := executeStep("stage", step, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {}, nil)
 
 	if result.Status != "skipped" {
 		t.Errorf("expected skipped, got %s", result.Status)
@@ -166,7 +166,7 @@ func TestExecuteStep_WhenConditionSkips(t *testing.T) {
 func TestExecuteStep_WhenConditionPasses(t *testing.T) {
 	exec := newFakeExecutor()
 	step := Step{Name: "test", Type: "shell", When: "SKA_BUILD_ID == 1"}
-	result := executeStep("stage", step, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {})
+	result := executeStep("stage", step, exec, map[string]string{"SKA_BUILD_ID": "1"}, func(s string) {}, nil)
 
 	if result.Status != "success" {
 		t.Errorf("expected success, got %s", result.Status)
@@ -176,7 +176,7 @@ func TestExecuteStep_WhenConditionPasses(t *testing.T) {
 func TestExecuteStep_WhenConditionEvalError(t *testing.T) {
 	exec := newFakeExecutor()
 	step := Step{Name: "test", Type: "shell", When: "garbage no operator"}
-	result := executeStep("stage", step, exec, map[string]string{}, func(s string) {})
+	result := executeStep("stage", step, exec, map[string]string{}, func(s string) {}, nil)
 
 	if result.Status != "failed" {
 		t.Errorf("expected failed (eval error), got %s", result.Status)
@@ -194,7 +194,7 @@ func TestRunPipeline_MultiStage_StopsAfterFailedStage(t *testing.T) {
 		},
 	}
 
-	_, err := RunPipeline(p, exec, nil, func(s string) {}, nil)
+	_, err := RunPipeline(p, exec, nil, func(s string) {}, nil, nil)
 	if err == nil {
 		t.Fatal("expected error from s1 failure")
 	}
@@ -211,7 +211,7 @@ func TestRunPipeline_AllSuccess(t *testing.T) {
 		},
 	}
 
-	results, err := RunPipeline(p, exec, nil, func(s string) {}, nil)
+	results, err := RunPipeline(p, exec, nil, func(s string) {}, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestExecuteStep_InjectsPlatformEnv(t *testing.T) {
 		},
 	}
 	globalEnv := map[string]string{"SKA_BUILD_ID": "1"}
-	result := executeStep("stage", step, exec, globalEnv, func(s string) {})
+	result := executeStep("stage", step, exec, globalEnv, func(s string) {}, nil)
 
 	if result.Status != "success" {
 		t.Fatalf("expected success, got %s", result.Status)
@@ -307,5 +307,95 @@ func TestExecuteStep_InjectsPlatformEnv(t *testing.T) {
 	// 共享的全局 env 不能被 step env 污染
 	if _, leaked := globalEnv["myEnv"]; leaked {
 		t.Error("step env leaked into shared global env")
+	}
+}
+
+func TestStage_ResolveEnv_PlatformGroups(t *testing.T) {
+	st := Stage{
+		Name: "build",
+		Env: map[string]map[string]string{
+			"default": {"version": "0.2.1"},
+			"windows": {"Ext": ".exe"},
+			"linux":   {"Ext": ""},
+		},
+	}
+
+	// windows 平台：default + windows
+	w := st.ResolveEnv("windows")
+	if w["version"] != "0.2.1" || w["Ext"] != ".exe" {
+		t.Errorf("windows env = %v, want version=0.2.1 Ext=.exe", w)
+	}
+
+	// linux 平台：default + linux（空值变量同样注入）
+	l := st.ResolveEnv("linux")
+	if l["version"] != "0.2.1" {
+		t.Errorf("linux env = %v, want version=0.2.1", l)
+	}
+	if ext, ok := l["Ext"]; !ok || ext != "" {
+		t.Errorf("linux env Ext = %q (exists %v), want empty string", ext, ok)
+	}
+
+	// darwin 平台：仅 default，无 Ext 键
+	d := st.ResolveEnv("darwin")
+	if d["version"] != "0.2.1" {
+		t.Errorf("darwin env = %v, want version=0.2.1", d)
+	}
+	if _, ok := d["Ext"]; ok {
+		t.Errorf("darwin env should not contain Ext: %v", d)
+	}
+
+	// 空 env 返回 nil
+	if empty := (Stage{}).ResolveEnv("windows"); empty != nil {
+		t.Errorf("empty stage env = %v, want nil", empty)
+	}
+}
+
+func TestRunPipeline_StageEnvSharedBySteps(t *testing.T) {
+	exec := newFakeExecutor()
+	pl := &Pipeline{Stages: []Stage{{
+		Name: "build",
+		Env: map[string]map[string]string{
+			"default": {"version": "0.2.1", "shared": "from-stage"},
+		},
+		Steps: []Step{
+			{Name: "plain", Type: "shell"},
+			// step env 覆盖 stage env 同名变量
+			{Name: "override", Type: "shell", Env: map[string]map[string]string{
+				"default": {"shared": "from-step"},
+			}},
+			// When 条件使用 stage env 变量
+			{Name: "cond", Type: "shell", When: "version == \"0.2.1\""},
+		},
+	}}}
+	globalEnv := map[string]string{"SKA_BUILD_ID": "1"}
+
+	results, err := RunPipeline(pl, exec, globalEnv, func(string) {}, nil, nil)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+	for _, r := range results {
+		if r.Status != "success" {
+			t.Errorf("%s status = %s (err %s), want success", r.StepName, r.Status, r.Error)
+		}
+	}
+
+	// stage env 注入到每个 step
+	if got := exec.envs["plain"]["version"]; got != "0.2.1" {
+		t.Errorf("plain version = %q, want 0.2.1 (stage env not shared)", got)
+	}
+	if got := exec.envs["plain"]["shared"]; got != "from-stage" {
+		t.Errorf("plain shared = %q, want from-stage", got)
+	}
+	// step env 覆盖 stage env 同名变量
+	if got := exec.envs["override"]["shared"]; got != "from-step" {
+		t.Errorf("override shared = %q, want from-step (step env should win)", got)
+	}
+	// When 条件可读取 stage env（cond 未被跳过即视为通过）
+	if results[2].Status == "skipped" {
+		t.Error("cond step skipped: When cannot see stage env")
+	}
+	// 共享的全局 env 不能被 stage env 污染
+	if _, leaked := globalEnv["version"]; leaked {
+		t.Error("stage env leaked into shared global env")
 	}
 }

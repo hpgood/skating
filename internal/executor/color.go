@@ -18,6 +18,7 @@ const (
 	colorPS      = colorCyan   // PowerShell: 青色
 	colorBash    = colorYellow // bash: 黄色
 	colorDocker  = colorGreen  // Docker 容器内执行: 绿色
+	colorSSH     = colorMagenta // SSH 远程执行: 品红色
 )
 
 // ansiPattern 匹配 ANSI 颜色转义序列（如 \x1b[36m）

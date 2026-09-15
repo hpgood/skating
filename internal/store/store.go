@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -59,6 +60,38 @@ func (s *Store) loadYAML(path string, target any) error {
 
 func (s *Store) projectsPath() string {
 	return filepath.Join(s.baseDir, "projects.yaml")
+}
+
+func (s *Store) configPath() string {
+	return filepath.Join(s.baseDir, "config.yaml")
+}
+
+// GlobalConfigPath 返回全局配置文件路径（~/.skating/config.yaml）
+func (s *Store) GlobalConfigPath() string {
+	return s.configPath()
+}
+
+// GetGlobalConfig 读取全局配置。
+// 文件或字段缺失时 MaxTasks 取默认值（CPU 核数，最小 1）。
+func (s *Store) GetGlobalConfig() (*GlobalConfig, error) {
+	var gc GlobalConfig
+	if err := s.loadYAML(s.configPath(), &gc); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("load global config: %w", err)
+		}
+	}
+	if gc.MaxTasks <= 0 {
+		gc.MaxTasks = runtime.NumCPU()
+		if gc.MaxTasks < 1 {
+			gc.MaxTasks = 1
+		}
+	}
+	return &gc, nil
+}
+
+// SaveGlobalConfig 保存全局配置到 ~/.skating/config.yaml
+func (s *Store) SaveGlobalConfig(gc *GlobalConfig) error {
+	return s.saveYAML(s.configPath(), gc)
 }
 
 // ListProjects 返回所有已注册的项目

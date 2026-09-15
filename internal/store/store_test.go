@@ -20,7 +20,6 @@ func TestStore_SaveAndGetProject(t *testing.T) {
 	p := &Project{
 		Name:       "demo",
 		Path:       "/tmp/demo",
-		Image:      "golang:1.21",
 		BuildID:    0,
 		LastStatus: "",
 		CreatedAt:  "2026-08-18T00:00:00Z",
@@ -33,7 +32,7 @@ func TestStore_SaveAndGetProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetProject failed: %v", err)
 	}
-	if got.Name != "demo" || got.Image != "golang:1.21" || got.Path != "/tmp/demo" {
+	if got.Name != "demo" || got.Path != "/tmp/demo" {
 		t.Errorf("GetProject returned wrong project: %+v", got)
 	}
 }
@@ -59,12 +58,12 @@ func TestStore_ListProjects_EmptyStore(t *testing.T) {
 
 func TestStore_SaveProject_UpdateExisting(t *testing.T) {
 	s := newTestStore(t)
-	p := &Project{Name: "demo", Path: "/tmp/demo", Image: "old:1.0"}
+	p := &Project{Name: "demo", Path: "/tmp/demo"}
 	if err := s.SaveProject(p); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
-	p.Image = "new:2.0"
+	p.Path = "/tmp/demo-v2"
 	p.BuildID = 5
 	if err := s.SaveProject(p); err != nil {
 		t.Fatalf("update save: %v", err)
@@ -74,8 +73,8 @@ func TestStore_SaveProject_UpdateExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetProject: %v", err)
 	}
-	if got.Image != "new:2.0" {
-		t.Errorf("image not updated: got %q", got.Image)
+	if got.Path != "/tmp/demo-v2" {
+		t.Errorf("path not updated: got %q", got.Path)
 	}
 	if got.BuildID != 5 {
 		t.Errorf("buildid not updated: got %d", got.BuildID)

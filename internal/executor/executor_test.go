@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -97,12 +99,17 @@ func TestRunner_ExecuteShell_PureCmdletStillSucceeds(t *testing.T) {
 func TestRunner_ExecuteShell_WorkdirIsHonored(t *testing.T) {
 	r := NewRunner()
 	dir := t.TempDir()
+	// 用标记文件验证 workdir：部分环境下 t.TempDir 返回 8.3 短路径（如 ADMINI~1），
+	// 而脚本里拿到的 cwd 是长路径，直接比较字符串不可靠
+	marker := "skating-workdir-marker"
+	if err := os.WriteFile(filepath.Join(dir, marker), nil, 0644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
 	var script string
 	if runtime.GOOS == "windows" {
-		// PowerShell 的 pwd/$PWD 走 Format-Table 会截断长路径，改用字符串输出
-		script = "Write-Output (Get-Location).Path"
+		script = fmt.Sprintf("if (Test-Path -LiteralPath './%s') { Write-Output WORKDIR-OK }", marker)
 	} else {
-		script = "pwd"
+		script = fmt.Sprintf("test -f ./%s && echo WORKDIR-OK", marker)
 	}
 	step := Step{
 		Name:   "pwd",
@@ -113,9 +120,15 @@ func TestRunner_ExecuteShell_WorkdirIsHonored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	// t.TempDir 返回的是绝对路径
-	if !strings.Contains(out, dir) {
-		t.Errorf("workdir not honored. dir=%s, output=%q", dir, out)
+	// 逐行精确匹配：PowerShell/bash 的 DEBUG/trace 行含脚本文本但不等于整行
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "WORKDIR-OK" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("workdir not honored: output=%q", out)
 	}
 }
 
@@ -209,24 +222,14 @@ func TestRunner_LuaSandbox_ErrorIncludesStepName(t *testing.T) {
 	}
 }
 
-func TestRunner_SetDockerImage_Available(t *testing.T) {
-	r := NewRunner()
-	r.SetDockerImage("golang:1.25")
-	if r.DockerImage() != "golang:1.25" {
-		t.Errorf("docker image not set")
-	}
-	// IsDockerAvailable 取决于 host 是否有 docker；只断言方法不 panic
-	_ = r.IsDockerAvailable()
-}
-
 func TestRunner_NoDocker_UsesHostShell(t *testing.T) {
-	// 配置 docker image 但 docker 不可用时，应降级到 host shell
+	// step 配置了 docker image 但 docker 不可用时，应降级到 host shell
 	r := NewRunner()
-	r.SetDockerImage("nonexistent:never")
-	// 即使 docker 配置了，host shell 也能跑（取决于 IsDockerAvailable）
+	// 即使 step 配置了镜像，host shell 也能跑（取决于 IsDockerAvailable）
 	step := Step{
 		Name:   "host-fallback",
 		Type:   "shell",
+		Image:  "nonexistent:never",
 		Script: "echo fallback-ok",
 	}
 	out, err := r.Execute(step, t.TempDir(), nil, nil)
@@ -282,4 +285,81 @@ func TestRunner_ExecuteShell_SourceFile(t *testing.T) {
 // writeFile 简化 os.WriteFile 调用
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0755)
+}
+
+// buildDockerRunArgs 应在内置参数之后追加用户 docker_options，
+// 且不包含镜像名（镜像由调用方追加）
+func TestBuildDockerRunArgs_UserOptionsAppended(t *testing.T) {
+	step := Step{
+		Name:          "pack",
+		Script:        "npm run build",
+		DockerOptions: []string{"--network", "host", "-v", "/tmp/cache:/var/cache"},
+	}
+	env := map[string]string{"GOOS": "linux", "Ext": ""}
+
+	args := buildDockerRunArgs(step, "skating-123", "C:/work", "C:/tmp/script.sh", "/tmp/skating-script.sh", env)
+
+	// 内置前置段
+	if args[0] != "run" || args[1] != "--rm" {
+		t.Fatalf("args head = %v, want [run --rm ...]", args[:2])
+	}
+	// 用户 options 应位于最后（调用方在其后追加镜像名）
+	wantTail := []string{"--network", "host", "-v", "/tmp/cache:/var/cache"}
+	gotTail := args[len(args)-len(wantTail):]
+	for i := range wantTail {
+		if gotTail[i] != wantTail[i] {
+			t.Fatalf("tail = %v, want %v", gotTail, wantTail)
+		}
+	}
+	// 内置 -w /work（默认容器工作目录）存在
+	if !contains(args, "-w") || !contains(args, "/work") {
+		t.Errorf("built-in -w /work missing: %v", args)
+	}
+	// env 按序注入
+	if !contains(args, "-e") || !contains(args, "Ext=") || !contains(args, "GOOS=linux") {
+		t.Errorf("env injection missing: %v", args)
+	}
+	// 内联脚本额外挂载存在
+	if !contains(args, "C:/tmp/script.sh:/tmp/skating-script.sh") {
+		t.Errorf("script mount missing: %v", args)
+	}
+	// 镜像名不应出现在前置参数中
+	if contains(args, "golang:1.25") {
+		t.Errorf("image must not be in pre-image args: %v", args)
+	}
+}
+
+// 无用户 options 时，前置参数以内置段结尾（内联脚本挂载在 -w 之后）
+func TestBuildDockerRunArgs_NoUserOptions(t *testing.T) {
+	step := Step{Name: "compile", Script: "go build"}
+	args := buildDockerRunArgs(step, "skating-1", "C:/work", "C:/tmp/s.sh", "/tmp/skating-script.sh", nil)
+	wantLast := "C:/tmp/s.sh:/tmp/skating-script.sh"
+	if len(args) == 0 || args[len(args)-1] != wantLast {
+		t.Fatalf("last built-in arg should be script mount %q, got %v", wantLast, args)
+	}
+}
+
+// step.workdir 自定义容器内工作目录：挂载点与 -w 同步，自动补 / 前缀
+func TestBuildDockerRunArgs_CustomWorkDir(t *testing.T) {
+	step := Step{Name: "build", Script: "go build", WorkDir: "gocache"}
+	args := buildDockerRunArgs(step, "skating-1", "C:/work", "C:/tmp/s.sh", "/tmp/skating-script.sh", nil)
+	if !contains(args, "C:/work:/gocache") || !contains(args, "-w") || !contains(args, "/gocache") {
+		t.Errorf("custom workdir not applied (want mount C:/work:/gocache and -w /gocache): %v", args)
+	}
+
+	// 以 / 开头时保持原样
+	step.WorkDir = "/custom/dir"
+	args = buildDockerRunArgs(step, "skating-1", "C:/work", "C:/tmp/s.sh", "/tmp/skating-script.sh", nil)
+	if !contains(args, "C:/work:/custom/dir") || !contains(args, "/custom/dir") {
+		t.Errorf("absolute workdir not preserved: %v", args)
+	}
+}
+
+func contains(arr []string, s string) bool {
+	for _, v := range arr {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

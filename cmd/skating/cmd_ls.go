@@ -33,7 +33,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, i18n.T("项目名\t路径\t镜像\t构建状态\t上次构建", "NAME\tPATH\tIMAGE\tSTATUS\tLAST BUILD"))
+	fmt.Fprintln(w, i18n.T("项目名\t路径\t构建状态\t上次构建", "NAME\tPATH\tSTATUS\tLAST BUILD"))
 	for _, p := range projects {
 		status := p.LastStatus
 		if status == "" {
@@ -43,7 +43,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 		if lastBuild == "" {
 			lastBuild = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", p.Name, p.Path, p.Image, status, lastBuild)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", p.Name, p.Path, status, lastBuild)
 	}
 	w.Flush()
 	return nil

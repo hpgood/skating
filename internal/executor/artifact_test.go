@@ -7,7 +7,7 @@ import (
 )
 
 func TestRunner_SaveArtifact_ToHostBucket(t *testing.T) {
-	r := NewRunner() // dockerImage 空 → bucket = "host"
+	r := NewRunner() // 未配置镜像 → bucket = "host"
 
 	// 准备源文件
 	srcDir := t.TempDir()
@@ -23,7 +23,7 @@ func TestRunner_SaveArtifact_ToHostBucket(t *testing.T) {
 	t.Setenv("USERPROFILE", tmpHome)
 	// 重新调用 SaveLog 不会受影响；我们要的是 saveArtifact 用 homeDir
 
-	dest, err := r.saveArtifact(srcPath)
+	dest, err := r.saveArtifact(srcPath, "")
 	if err != nil {
 		t.Fatalf("saveArtifact: %v", err)
 	}
@@ -45,7 +45,6 @@ func TestRunner_SaveArtifact_ToHostBucket(t *testing.T) {
 
 func TestRunner_SaveArtifact_BucketedByDockerImage(t *testing.T) {
 	r := NewRunner()
-	r.SetDockerImage("golang:1.25")
 
 	srcDir := t.TempDir()
 	srcPath := filepath.Join(srcDir, "out")
@@ -55,7 +54,7 @@ func TestRunner_SaveArtifact_BucketedByDockerImage(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("USERPROFILE", tmpHome)
 
-	dest, err := r.saveArtifact(srcPath)
+	dest, err := r.saveArtifact(srcPath, "golang:1.25")
 	if err != nil {
 		t.Fatalf("saveArtifact: %v", err)
 	}
@@ -93,7 +92,7 @@ func TestRunner_SaveArtifact_MissingSource(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
-	_, err := r.saveArtifact("/nonexistent/file")
+	_, err := r.saveArtifact("/nonexistent/file", "")
 	if err == nil {
 		t.Fatal("expected error for missing source")
 	}

@@ -17,7 +17,7 @@ func (r *Runner) runLua(step Step, workDir string, env map[string]string, logFn 
 
 	// 注册安全 API（每次执行刷新 env 引用）
 	// 传入父 Runner 引用和 workDir，使 Lua 调用的 sh() 能复用
-	r.registerLuaAPI(L, env, workDir, logFn)
+	r.registerLuaAPI(L, env, workDir, logFn, step.Image)
 
 	// 加载并执行 Lua 代码
 	var luaCode string
@@ -46,8 +46,19 @@ func (r *Runner) runLua(step Step, workDir string, env map[string]string, logFn 
 	}))
 	defer L.SetGlobal("print", L.NewFunction(luaPrintOriginal))
 
+	// 软超时：Lua 解释器（yaegi/gopher-lua 单线程执行）无法被安全硬中断，
+	// 只能在进入前与结束后检查 ctx；执行期间发起的 sh() 内部 shell 命令
+	// 会随 ctx 取消被终止（见 runShell）。若脚本本身死循环，由上层进程退出兜底。
+	if err := r.ctx.Err(); err != nil {
+		return "", fmt.Errorf("step %q: context canceled before lua execution: %w", step.Name, err)
+	}
+
 	if err := L.DoString(luaCode); err != nil {
 		return printBuf.String(), fmt.Errorf("step %q: lua execution failed: %w", step.Name, err)
+	}
+
+	if err := r.ctx.Err(); err != nil {
+		return printBuf.String(), fmt.Errorf("step %q: context canceled after lua execution: %w", step.Name, err)
 	}
 
 	return printBuf.String(), nil
@@ -109,7 +120,8 @@ func (r *Runner) CloseLua() {
 
 // registerLuaAPI 向 Lua 虚拟机注册安全的 Go API
 // parentWorkDir 来自父步骤的工作目录；Lua sh() 内部调用时复用，避免 workdir 丢失
-func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWorkDir string, logFn func(msg string)) {
+// stepImage 为当前 Lua 步骤配置的镜像，供 upload_artifact 分桶使用
+func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWorkDir string, logFn func(msg string), stepImage string) {
 	// sh(command) - 执行 shell 命令，复用父 Runner 配置
 	L.SetGlobal("sh", L.NewFunction(func(L *lua.LState) int {
 		command := L.CheckString(1)
@@ -141,7 +153,9 @@ func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWork
 		return 0
 	}))
 
-	// set_env(key, value) - 设置环境变量
+	// set_env(key, value) - 设置环境变量：
+	// 当前 step 内立即生效（sh()/getenv 可见），并经 Runner.onSetVar 回调
+	// 写入构建级共享变量池，后续 step（含 When 条件）可见
 	L.SetGlobal("set_env", L.NewFunction(func(L *lua.LState) int {
 		key := L.CheckString(1)
 		value := L.CheckString(2)
@@ -149,6 +163,9 @@ func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWork
 			env = map[string]string{}
 		}
 		env[key] = value
+		if r.onSetVar != nil {
+			r.onSetVar(key, value)
+		}
 		return 0
 	}))
 
@@ -163,7 +180,7 @@ func (r *Runner) registerLuaAPI(L *lua.LState, env map[string]string, parentWork
 	// upload_artifact(path) - 上传构建产物（写到 ~/.skating/artifacts/）
 	L.SetGlobal("upload_artifact", L.NewFunction(func(L *lua.LState) int {
 		path := L.CheckString(1)
-		dest, err := r.saveArtifact(path)
+		dest, err := r.saveArtifact(path, stepImage)
 		if err != nil {
 			L.Push(lua.LString(""))
 			L.Push(lua.LString(fmt.Sprintf("upload_artifact failed: %v", err)))

@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,6 +37,8 @@ func setupE2E(t *testing.T) string {
 	// t.Setenv automatically restores on test cleanup.
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	// Windows 上 os.UserHomeDir() 读 USERPROFILE 而非 HOME，两个都要指到隔离目录
+	t.Setenv("USERPROFILE", tmpDir)
 	t.Setenv("SKATING_DISABLE_DOCKER", "1")
 	return tmpDir
 }
@@ -199,9 +203,6 @@ func TestInit_CreatesProjectAndFiles(t *testing.T) {
 	}
 	if p.Path != projDir {
 		t.Errorf("project.Path = %q, want %q", p.Path, projDir)
-	}
-	if p.Image != "golang:1.21" {
-		t.Errorf("project.Image = %q, want golang:1.21", p.Image)
 	}
 
 	// 4. stdout mentions success
@@ -423,12 +424,13 @@ func TestRun_UnknownProject(t *testing.T) {
 	}
 }
 
-// TestRun_InjectedBuildEnvVars 验证 cmd_run 注入的三个 build-time env
-// (SKA_BUILD_ID / SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE) 都能从 step 里读到,
+// TestRun_InjectedBuildEnvVars 验证 cmd_run 注入的 build-time env
+// (SKA_BUILD_ID / SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE / SKA_GIT_COMMIT_ID) 都能从 step 里读到,
 // 且格式/一致性正确:
 //   - SKA_BUILD_TIMESTAMP 是 10 位整数 unix 秒 (UTC)
 //   - SKA_BUILD_DATE     是 RFC3339 字符串以 'Z' 结尾 (UTC)
 //   - 转 SKA_BUILD_TIMESTAMP 回 UTC 日期 ≈ SKA_BUILD_DATE (一致性)
+//   - SKA_GIT_COMMIT_ID  在非 git 项目目录下为空字符串
 //
 // 注意 runShell 把脚本 stdout 写到自己的 bytes.Buffer, 不会通过 logFn 转发,
 // 所以这里用 exit 1 让 executor 失败, 把 stdout 拼到 error message 里显示出来
@@ -457,6 +459,8 @@ pipeline:
             echo "SKA_BUILD_ID=${SKA_BUILD_ID}"
             echo "SKA_BUILD_TIMESTAMP=${SKA_BUILD_TIMESTAMP}"
             echo "SKA_BUILD_DATE=${SKA_BUILD_DATE}"
+            echo "SKA_GIT_COMMIT_ID=${SKA_GIT_COMMIT_ID}"
+            echo "SKA_OS=${SKA_OS}"
             echo "ROUNDTRIP=$(date -u -d @${SKA_BUILD_TIMESTAMP} +%Y-%m-%dT%H:%M:%SZ)"
             exit 1
 `
@@ -533,6 +537,171 @@ pipeline:
 	if roundtripStr != "" && roundtripStr != dateStr {
 		t.Errorf("SKA_BUILD_TIMESTAMP (unix %s) converted back via 'date -u -d @...' = %q, but SKA_BUILD_DATE = %q (should be equal)",
 			tsStr, roundtripStr, dateStr)
+	}
+
+	// 5. SKA_GIT_COMMIT_ID: 非 git 项目目录（t.TempDir 无 .git）下必须为空字符串
+	var commitStr string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "SKA_GIT_COMMIT_ID=") {
+			commitStr = strings.TrimRight(strings.TrimPrefix(line, "SKA_GIT_COMMIT_ID="), "\r")
+		}
+	}
+	if commitStr != "" {
+		t.Errorf("SKA_GIT_COMMIT_ID = %q, want empty (project dir has no .git)", commitStr)
+	}
+
+	// 6. SKA_OS: 必须等于测试进程的 runtime.GOOS
+	var osStr string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "SKA_OS=") {
+			osStr = strings.TrimRight(strings.TrimPrefix(line, "SKA_OS="), "\r")
+		}
+	}
+	if osStr != runtime.GOOS {
+		t.Errorf("SKA_OS = %q, want %q (runtime.GOOS)", osStr, runtime.GOOS)
+	}
+}
+
+// TestRun_GitCommitIDInjected 验证项目目录是 git 仓库时 SKA_GIT_COMMIT_ID
+// 注入完整的 commit hash（git rev-parse HEAD，40 位），且与仓库实际 HEAD 一致。
+func TestRun_GitCommitIDInjected(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "gittest")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	// 在项目目录里建一个真实 git 仓库并提交
+	gitRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = projDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	gitRun("init")
+	gitRun("config", "user.email", "skating-test@example.com")
+	gitRun("config", "user.name", "skating test")
+	gitRun("add", ".")
+	// --no-gpg-sign 避免宿主机全局配置强制签名导致失败
+	gitRun("commit", "--no-gpg-sign", "-m", "init")
+
+	// 期望值：仓库当前 HEAD 的完整 hash
+	want := gitCommitID(projDir)
+	if len(want) != 40 {
+		t.Fatalf("gitCommitID = %q, want 40-char full hash", want)
+	}
+
+	yamlContent := `name: gittest
+pipeline:
+  stages:
+    - name: probe
+      steps:
+        - name: dump-commit
+          type: shell
+          script: |
+            echo "SKA_GIT_COMMIT_ID=${SKA_GIT_COMMIT_ID}"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "gittest")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR (we forced exit 1), got stderr=%q", stderr)
+	}
+
+	combined := stdout + stderr
+	var got string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "SKA_GIT_COMMIT_ID=") {
+			got = strings.TrimRight(strings.TrimPrefix(line, "SKA_GIT_COMMIT_ID="), "\r")
+		}
+	}
+	if got != want {
+		t.Errorf("SKA_GIT_COMMIT_ID = %q, want %q", got, want)
+	}
+}
+
+// TestRun_GitBranchInjected 验证项目目录是 git 仓库时 SKA_GIT_BRANCH
+// 注入当前分支名，且与仓库实际分支一致（git rev-parse --abbrev-ref HEAD）。
+func TestRun_GitBranchInjected(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "branchtest")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	// 在项目目录里建一个真实 git 仓库并提交
+	gitRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = projDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	gitRun("init")
+	gitRun("config", "user.email", "skating-test@example.com")
+	gitRun("config", "user.name", "skating test")
+	gitRun("add", ".")
+	gitRun("commit", "--no-gpg-sign", "-m", "init")
+
+	// 期望值：仓库当前分支名（与注入同一查询方式）
+	want := gitBranch(projDir)
+	if want == "" {
+		t.Fatal("gitBranch = empty, want current branch name")
+	}
+
+	yamlContent := `name: branchtest
+pipeline:
+  stages:
+    - name: probe
+      steps:
+        - name: dump-branch
+          type: shell
+          script: |
+            echo "SKA_GIT_BRANCH=${SKA_GIT_BRANCH}"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "branchtest")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR (we forced exit 1), got stderr=%q", stderr)
+	}
+
+	combined := stdout + stderr
+	var got string
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.HasPrefix(line, "SKA_GIT_BRANCH=") {
+			got = strings.TrimRight(strings.TrimPrefix(line, "SKA_GIT_BRANCH="), "\r")
+		}
+	}
+	if got != want {
+		t.Errorf("SKA_GIT_BRANCH = %q, want %q", got, want)
 	}
 }
 
@@ -864,5 +1033,68 @@ pipeline:
 	}
 	if !strings.Contains(combined, "[after/c] skipped") {
 		t.Errorf("expected [after/c] skipped marker: %q", combined)
+	}
+}
+
+// TestRun_CrossStepVarPassing 验证 ::set-var 跨 step 传变量：
+// producer echo "::set-var GREETING=hello" 写入构建级变量池，
+// consumer 的 When 条件与脚本均能读到 GREETING；标记行本身不进日志。
+func TestRun_CrossStepVarPassing(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "varpooltest")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	yamlContent := `name: varpooltest
+pipeline:
+  stages:
+    - name: pass-vars
+      steps:
+        - name: producer
+          type: shell
+          script: |
+            echo "::set-var GREETING=hello"
+        - name: consumer
+          type: shell
+          when: "GREETING == hello"
+          script: |
+            echo "GREETING=${GREETING}"
+        - name: wrong-cond
+          type: shell
+          when: "GREETING == world"
+          script: |
+            echo "WRONG-RAN"
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "varpooltest")
+	if strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("run failed: %q", stderr)
+	}
+	combined := stdout + stderr
+
+	// 1. consumer 的 When 条件通过并读到变量
+	if !strings.Contains(combined, "GREETING=hello") {
+		t.Errorf("consumer did not see GREETING=hello; output: %q", combined)
+	}
+
+	// 2. 值不匹配的 When 条件走 skipped
+	if !strings.Contains(combined, "[pass-vars/wrong-cond] skipped") {
+		t.Errorf("wrong-cond should be skipped; output: %q", combined)
+	}
+
+	// 3. 标记行不进日志（逐行精确比对：PS DEBUG trace 行含标记文本但带前缀，不算泄漏）
+	for _, line := range strings.Split(combined, "\n") {
+		if strings.TrimSpace(line) == "::set-var GREETING=hello" {
+			t.Errorf("marker line leaked into log: %q", line)
+		}
 	}
 }

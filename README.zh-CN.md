@@ -5,8 +5,9 @@
 ## 特性
 
 - **一键安装** — 单二进制文件，无需数据库，数据存储于本地 YAML 文件
-- **三层架构** — Pipeline DSL 编排 + Shell/Lua 执行引擎 + Yaegi 插件扩展
+- **三层架构** — Pipeline DSL 编排 + Shell/Lua/SSH/SCP/Sync 执行引擎 + Yaegi 插件扩展
 - **Docker 沙箱** — 在容器内隔离构建，环境一致
+- **远程部署** — 原生 SSH 执行器 + 基于 SFTP 的 scp/sync 文件传输
 - **跨平台** — Windows / Linux / macOS 全支持
 
 ## Skating vs Drone
@@ -16,7 +17,7 @@
 | **部署** | 单二进制，`go install` 即用 | 需要 Server + Runner + 数据库 |
 | **数据库** | 无，本地 YAML 文件 | PostgreSQL / MySQL / SQLite |
 | **配置** | 单文件 `.skating.yaml`，在项目内 | `.drone.yml` + Web UI 配置 |
-| **执行层** | Shell + Lua (Gopher-Lua 沙箱) | 纯 Shell / 插件 |
+| **执行层** | Shell + Lua (Gopher-Lua 沙箱) + SSH/SCP/Sync | 纯 Shell / 插件 |
 | **插件** | Yaegi Go 解释器，原生性能 | Docker 容器化插件 |
 | **并行** | Stage 级别原生 goroutine | 多 Runner / 多 Pipeline |
 | **缓存** | 无外部依赖 | 需 Redis 或共享卷 |
@@ -147,7 +148,7 @@ skating update
 ┌─────────────────────────────┐
 │  Pipeline DSL (YAML)        │  ← Stage / Parallel / When 编排
 ├─────────────────────────────┤
-│  执行引擎 (Shell + Lua)      │  ← 实际构建命令执行，Lua 安全沙箱
+│  执行引擎                    │  ← Shell + Lua + SSH/SCP/Sync
 ├─────────────────────────────┤
 │  插件扩展 (Yaegi)            │  ← Go 插件动态加载，通知/审查等
 └─────────────────────────────┘
@@ -201,6 +202,8 @@ pipeline:
 | `SKA_BUILD_ID`        | 整数（字符串） | `1`           | 自增构建编号（从 1 起） |
 | `SKA_BUILD_TIMESTAMP` | 整数（字符串） | `1787139682`  | 构建开始时间的 **Unix 秒（UTC）**——便于排序 / 算 diff / 数值比较 |
 | `SKA_BUILD_DATE`      | 字符串         | `2026-08-19T11:41:22Z` | 构建开始时间的 **RFC3339（UTC）**——人类可读，用于报告 / 日志 |
+| `SKA_GIT_COMMIT_ID`   | 字符串         | `9a2c1f0d...` | 项目当前的 git commit id（**完整 hash**）；项目无 `.git` 时为空 |
+| `SKA_OS`              | 字符串         | `linux`       | 运行时操作系统类型（`runtime.GOOS`）：`linux`、`windows`、`darwin`... |
 
 Shell 脚本用法：
 ```bash
@@ -239,6 +242,29 @@ steps:
       go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
 ```
 
+### Stage 级环境变量（`env`）
+
+stage 也可以定义 `env`，由**该 stage 内所有 step 共享**（平台分组规则与 step env 相同）。同名变量优先级：构建 env（`SKA_*`、`--env`）< stage env < step env：
+
+```yaml
+stages:
+  - name: build
+    env:                 # 该 stage 内所有 step 共享
+      default:
+        version: "0.2.1"
+      windows:
+        Ext: ".exe"
+      linux:
+        Ext: ""
+    steps:
+      - name: compile
+        type: shell
+        script: |
+          go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
+```
+
+stage env 变量对脚本（`${VAR}`）和 `when` 条件均可见。
+
 ### 用 `SKA_SHELL` 指定脚本执行方式
 
 `shell` step 默认使用的 shell：
@@ -256,6 +282,60 @@ env:
     SKA_SHELL: "pwsh -NoLogo"
 # 实际执行: pwsh -NoLogo <script>
 ```
+
+## 远程执行与文件传输（SSH / SCP / Sync）
+
+Step 可以在远程服务器上执行命令，或在本地与远端之间传输文件。
+三种类型复用同一组连接字段（`host` / `port` / `user` / `auth` / `secret`），
+底层由原生 Go SSH 实现（`golang.org/x/crypto/ssh`）驱动——无需本地安装
+ssh.exe、sshpass 或 scp。
+
+Secret 按名字引用（用 `skating secret set <name>` 存储，支持密码或 PEM
+私钥）；secret 值永远不会出现在 yaml 和日志中。
+
+```yaml
+steps:
+  # 1) 在远程服务器上执行命令
+  - name: remote-build
+    type: ssh
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass          # password（默认）或 "key" 认证
+    workdir: /opt/app
+    script: |
+      ./deploy.sh ${SKA_GIT_BRANCH}
+
+  # 2) scp：本地→远端复制文件/目录（push，默认方向），或远端→本地（pull）
+  - name: upload-artifact
+    type: scp
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist/app-${SKA_GIT_BRANCH}.tar.gz
+    remote: /opt/app/app.tar.gz
+
+  # 3) sync：本地目录的 rsync 式增量镜像上传
+  - name: sync-dist
+    type: sync
+    host: 10.0.0.1
+    user: deploy
+    secret: deploy-pass
+    local: dist
+    remote: /opt/app/dist
+    delete: true                 # 默认：删除本地已不存在的远端文件
+```
+
+行为说明：
+- `scp` 支持双向：`direction: push`（本地→远端，默认）和 `direction: pull`
+  （远端→本地）。文件与目录均递归复制，并保留 mtime——后续 `sync`
+  可据此跳过未变化文件
+- `sync` 只上传有变化的文件（按 size + mtime 秒级精度比较），且默认镜像
+  本地目录：删除远端已不存在的文件。首次部署时远端目录可以不存在
+- `local` / `remote` 支持 `${VAR}` 变量展开（取自 step env 视图：
+  `SKA_*` 系统变量、step env、跨 step 变量池）。`host`、`user` 与 `workdir`
+  （ssh）同样支持 `${VAR}`（如 `host: 10.0.0.${SEG}`）——未定义变量保留原样，
+  拼错变量名会在连接时暴露原始值，而非静默连错主机
+- 构建取消/超时会自动关闭 SSH 连接
 
 ## 数据存储
 
