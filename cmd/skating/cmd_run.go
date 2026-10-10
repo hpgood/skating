@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,10 @@ var (
 	//   "build/compile"     → 只运行 stage=build 里的 step=compile
 	runStep string
 
+	// runGroup 指定只运行 .skating.yaml 中 pipeline.groups 定义的某个 stage 组。
+	// 与 runStep 互斥。
+	runGroup string
+
 	// runUserEnv 是用户通过 -e KEY=VAL 传入的环境变量。
 	// StringArray：允许重复 -e 传多个；后传入的同名变量覆盖前面的。
 	// 最终注入到 pipeline env 时优先级高于 SKA_ 系统 env（用户显式传值胜出）。
@@ -36,21 +41,55 @@ var (
 )
 
 var runCmd = &cobra.Command{
-	Use:   "run [project-name]",
+	Use:   "run [project-name[+group]]",
 	Short: i18n.T("运行构建", "Run a build"),
 	Args:  cobra.MaximumNArgs(1),
 	RunE:  runRun,
 }
 
 func init() {
-	runCmd.Flags().StringVar(&runStep, "step", "", i18n.T("只运行指定的 stage 或 step（格式: <stage> 或 <stage>/<step>）", "run only the named stage/step (format: <stage> or <stage>/<step>)"))
-	runCmd.Flags().StringArrayVar(&runUserEnv, "env", nil, i18n.T("向 step 注入自定义环境变量，格式 KEY=VAL，可重复传入", "inject custom env into steps, format KEY=VAL, repeatable"))
+	runCmd.Flags().StringVarP(&runStep, "step", "s", "", i18n.T("只运行指定的 stage 或 step（格式: <stage> 或 <stage>/<step>）", "run only the named stage/step (format: <stage> or <stage>/<step>)"))
+	runCmd.Flags().StringVarP(&runGroup, "group", "g", "", i18n.T("只运行指定 group 内的 stage（在 .skating.yaml 的 pipeline.groups 中定义）", "run only the stages in the named group (defined under pipeline.groups)"))
+	runCmd.Flags().StringArrayVarP(&runUserEnv, "env", "e", nil, i18n.T("向 step 注入自定义环境变量，格式 KEY=VAL，可重复传入", "inject custom env into steps, format KEY=VAL, repeatable"))
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
+	// 位置参数支持 <project>+<group> / +<group> 简写（等价于 --group）。
+	// 无 '+' 时保持旧行为：args[0] 即项目名。
+	var rawArg string
+	if len(args) > 0 {
+		rawArg = args[0]
+	}
+	argProj, argGroup, hasSep := splitGroupArg(rawArg)
+
+	// 位置 +group 与 -g/--group 互斥
+	if hasSep && runGroup != "" {
+		return errors.New(i18n.T(
+			"位置参数 +<group> 与 --group 不能同时使用",
+			"group specified twice: positional +<group> and --group"))
+	}
+	// 空 group 名（"prj+" / "+"）明确报错，不静默当作纯项目名
+	if hasSep && argGroup == "" {
+		return fmt.Errorf(i18n.T(
+			"位置参数 %q 中 + 后缺少 group 名",
+			"missing group name after '+' in %q"), rawArg)
+	}
+
+	groupName := runGroup
+	if hasSep {
+		groupName = argGroup
+	}
+	// group 与 step 互斥（含位置 +group 形式）。校验前移到 store/NextBuildID 之前，
+	// 避免无效命令也递增 build 号、打印构建标题。
+	if runStep != "" && groupName != "" {
+		return errors.New(i18n.T("--group 与 --step 不能同时使用", "--group and --step are mutually exclusive"))
+	}
+
 	var projName string
 	var projPath string
-	isAdHoc := len(args) == 0
+	// isAdHoc：无位置参数，或位置参数为 +group（无项目名）。
+	// 注意显式空串 `skating run ""` 仍按“项目名为空”处理（保持旧行为），不算 ad-hoc。
+	isAdHoc := len(args) == 0 || (hasSep && argProj == "")
 
 	if isAdHoc {
 		var err error
@@ -67,7 +106,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 			projName = filepath.Base(projPath)
 		}
 	} else {
-		projName = args[0]
+		projName = argProj
 	}
 
 	s, err := store.NewStore()
@@ -127,8 +166,14 @@ func runRun(cmd *cobra.Command, args []string) error {
 		"SKA_OS":              runtime.GOOS,
 	}
 
-	// 解析 --step 过滤参数。先验证 stage/step 都存在，再交给 runner。
-	runOpts, err := parseRunStep(runStep, pl)
+	// 解析 --step / --group 过滤参数（--group 与 --step 已在函数开头校验互斥）。
+	// 先验证 stage/step/group 都存在，再交给 runner。
+	var runOpts *pipeline.RunOptions
+	if groupName != "" {
+		runOpts, err = parseRunGroup(groupName, cfg)
+	} else {
+		runOpts, err = parseRunStep(runStep, pl)
+	}
 	if err != nil {
 		return err
 	}
@@ -181,7 +226,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	// 总 step 数：按 --step 过滤后实际会执行的 step 数（供进度展示）
 	totalSteps := 0
 	for _, stage := range pl.Stages {
-		if runOpts != nil && runOpts.StageName != "" && stage.Name != runOpts.StageName {
+		if runOpts != nil && !runOpts.SelectsStage(stage.Name) {
 			continue
 		}
 		if runOpts != nil && runOpts.StepName != "" {
@@ -542,6 +587,51 @@ func parseRunStep(raw string, pl *pipeline.Pipeline) (*pipeline.RunOptions, erro
 
 	// 不可达，但编译器要求
 	return nil, nil
+}
+
+// splitGroupArg 解析位置参数 <project>+<group> 形式（按第一个 '+' 切分）。
+//
+//	"prj+grp" → ("prj", "grp", true)
+//	"+grp"    → ("",    "grp", true)
+//	"prj"     → ("prj", "",    false)
+//	""        → ("",    "",    false)
+//
+// 注意：项目名本身含 '+' 时会被误解析为分隔符；项目名来自目录名或 yaml name，
+// 实际不会含 '+'，暂不做转义。
+func splitGroupArg(arg string) (project, group string, hasSep bool) {
+	project, group, hasSep = strings.Cut(arg, "+")
+	return
+}
+
+// parseRunGroup 把 --group <name> 解析成 RunOptions（Stages 集合）。
+//
+// 不允许的情况:
+//   - .skating.yaml 未定义任何 pipeline.groups → 报错
+//   - 组名不存在 → 报错并列出已知组名（排序）
+//
+// 组到 stage 的映射在 LoadConfig 阶段已校验（组内条目必须是已声明 stage）。
+func parseRunGroup(raw string, cfg *pipeline.Config) (*pipeline.RunOptions, error) {
+	groups := cfg.Pipeline.Groups
+	if len(groups) == 0 {
+		return nil, errors.New(i18n.T(
+			"当前 .skating.yaml 未定义任何 pipeline.groups",
+			"no pipeline.groups defined in .skating.yaml"))
+	}
+
+	refs, ok := groups[raw]
+	if !ok {
+		known := slices.Sorted(maps.Keys(groups))
+		return nil, fmt.Errorf(i18n.T(
+			"--group %q 不存在。已知 group: %v",
+			"group %q not found. Known groups: %v"),
+			raw, known)
+	}
+
+	set := make(map[string]bool, len(refs))
+	for _, name := range refs {
+		set[name] = true
+	}
+	return &pipeline.RunOptions{Stages: set}, nil
 }
 
 // injectUserEnv 把 -e KEY=VAL 列表注入到 env map。

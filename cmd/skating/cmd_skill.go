@@ -48,17 +48,26 @@ Initialize a skating project in the current directory.
 - Steps run on the host shell by default; set a step-level docker image
   in .skating.yaml to run that step inside a container instead
 
-### skating run [project-name]
-Execute the full pipeline. The project name is optional:
+### skating run [project-name[+group]]
+Execute the full pipeline. The positional argument is optional:
 - With a name: run the registered project
 - Without a name (ad-hoc mode): use the .skating.yaml in the current directory;
   the project is auto-registered if not yet known
+- <project>+<group>: run only that group of stages in the named project
+- +<group> (ad-hoc): run only that group using the .skating.yaml in the current
+  directory; the part before '+' is the project name (empty = ad-hoc)
 Options:
-- --step <stage> or <stage>/<step>: run only the named stage or step.
+- --step <stage> or <stage>/<step> (short: -s): run only the named stage or step.
   Stages/steps not selected are recorded as skipped. In --step <stage> mode a
   sequential stage continues past a failing step so the whole stage reports.
-- --env KEY=VAL: inject custom env into steps. Repeatable; later values win;
-  on conflict user values override skating system env (SKA_*)
+- --group <name> (short: -g): run only the stages in the named group defined
+  under pipeline.groups. Mutually exclusive with --step. The positional forms
+  <project>+<group> and +<group> (ad-hoc current directory) are equivalent to
+  --group; they are mutually exclusive with -g/--group and with --step. The
+  separator is '+' because a leading '@' is silently swallowed by PowerShell.
+  Project names containing '+' are not supported.
+- --env KEY=VAL (short: -e): inject custom env into steps. Repeatable; later
+  values win; on conflict user values override skating system env (SKA_*)
 Workflow:
 1. Load project (registry or ad-hoc) and read .skating.yaml from the project path
 2. Increment and inject SKA_BUILD_ID (plus SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE,
@@ -120,12 +129,15 @@ Output this SKILL document. Use --lang zh-CN for Chinese.
 ` + "```yaml" + `
 name: project-name          # Project identifier
 pipeline:
+  groups:                   # Named stage sets for skating run --group/-g <name>
+    all:        [init, build, test]
+    only_build: [build]
   stages:
     - name: stage-name
       parallel: false       # If true, run all steps in this stage concurrently
       env:                  # Stage-level env, shared by all steps in the stage
         default:            # (optional; same grouping rules as step env:
-          version: "0.2.1"  #  stage env < step env on same-name conflict)
+          version: "0.2.${SKA_BUILD_ID}"  # ${VAR} interpolated; stage env < step env)
         windows:
           Ext: ".exe"
       steps:
@@ -219,6 +231,11 @@ pipeline:
 - With --step filtering, stages/steps not selected are recorded as skipped (visible
   in the summary); in --step <stage> mode a sequential stage continues past failing
   steps so the whole stage reports, while the overall build stays failed
+- With --group filtering, only the selected stages run in declaration order; the
+  first failing stage stops the group and every remaining selected stage is recorded
+  as skipped, with the overall build still failed. The positional <project>+<group>
+  / +<group> shorthand behaves identically. Unknown stages in any group are
+  rejected at config-load time
 
 ## Cross-Step Variables
 Steps can pass variables to subsequent steps via a build-level variable pool.
@@ -445,6 +462,11 @@ Examples:
 - --env KEY=VAL (skating run): user-provided; overrides SKA_* system values on conflict.
 - User-defined via set_env() in Lua scripts (current step + later steps, see
   Cross-Step Variables).
+- env value interpolation: values in stage/step env may reference other variables
+  with ${VAR} or $VAR and concatenate them with literal text (e.g.
+  version: "0.2.${SKA_BUILD_ID}"). References are resolved by skating before the
+  step runs, against build env / --env / variable pool / stage env; chains within
+  the same env block are followed; undefined variables expand to an empty string.
 
 ## Data Storage
 All data under ~/.skating/:
@@ -535,15 +557,22 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 - 步骤默认在 host shell 执行；在 .skating.yaml 中为 step 设置 docker 镜像
   可改为容器内执行
 
-### skating run [项目名]
-执行项目的完整流水线。项目名可选：
+### skating run [项目名[+group]]
+执行项目的完整流水线。位置参数可选：
 - 传名称：运行已注册项目
 - 不传（adhoc 模式）：使用当前目录的 .skating.yaml；未注册时自动注册
+- <project>+<group>：只运行指定项目中的该 group 内的 stage
+- +<group>（adhoc）：用当前目录的 .skating.yaml 只运行该 group；'+' 之前为
+  项目名（为空即 adhoc）
 选项：
-- --step <stage> 或 <stage>/<step>：只运行指定 stage 或 step。未选中的
+- --step <stage> 或 <stage>/<step>（短选项 -s）：只运行指定 stage 或 step。未选中的
   stage/step 会记为 skipped。--step <stage> 模式下，串行 stage 中某 step
   失败后仍继续跑完剩余 step，便于看到整个 stage 的完整结果
-- --env KEY=VAL：向 step 注入自定义环境变量。可重复传入，后者覆盖前者；
+- --group <name>（短选项 -g）：只运行 pipeline.groups 中定义的指定 group 内的
+  stage。与 --step 互斥。位置参数形式 <project>+<group> 与 +<group>（ad-hoc
+  当前目录）等价于 --group；它们与 -g/--group 以及 --step 均互斥。分隔符用
+  '+' 而非 '@'（行首 '@' 会被 PowerShell 静默丢弃）。项目名本身含 '+' 不支持。
+- --env KEY=VAL（短选项 -e）：向 step 注入自定义环境变量。可重复传入，后者覆盖前者；
   与系统 SKA_* 变量冲突时用户值优先
 工作流：
 1. 加载项目（注册表或 adhoc），从项目路径读取 .skating.yaml
@@ -604,12 +633,15 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 ` + "```yaml" + `
 name: project-name          # 项目标识
 pipeline:
+  groups:                   # 命名 stage 集合，供 skating run --group/-g <name> 使用
+    all:        [init, build, test]
+    only_build: [build]
   stages:
     - name: stage-name
       parallel: false       # 若为 true，该 Stage 内的 Steps 并发执行
       env:                  # stage 级环境变量，该 Stage 内所有 Steps 共享
         default:            # （可选；分组规则与 step env 相同：
-          version: "0.2.1"  #  同名变量 step 覆盖 stage）
+          version: "0.2.${SKA_BUILD_ID}"  # ${VAR} 会展开；同名 step env 覆盖 stage）
         windows:
           Ext: ".exe"
       steps:
@@ -697,6 +729,10 @@ pipeline:
 - 使用 --step 过滤时，未选中的 stage/step 记为 skipped（在摘要中可见）；
   --step <stage> 模式下串行 stage 失败后继续执行剩余 step 以报告完整结果，
   但整体构建状态仍为失败
+- 使用 --group 过滤时，仅按声明顺序运行被选中的 stage；首个失败 stage 即停止
+  该组，其后剩余的被选中 stage 记为 skipped，整体构建状态仍为失败。位置参数
+  <project>+<group> / +<group> 简写行为完全一致。任何组中出现未知 stage 都会在
+  配置加载阶段直接报错
 
 ## 跨 Step 变量
 Step 可以通过构建级变量池向后续 Step 传递变量。池中的变量对之后每个 Step
@@ -907,6 +943,10 @@ set_env("CUSTOM_VAR", "value")
 - step env：在 .skating.yaml 中按 step 定义（default + 平台分组）。
 - --env KEY=VAL（skating run）：用户传入；与 SKA_* 系统变量冲突时用户值优先。
 - 通过 Lua 的 set_env() 可自定义变量（当前 step + 后续 step 生效，见跨 Step 变量）。
+- env 值拼接：stage/step env 的值可用 ${VAR} 或 $VAR 引用其他变量并与固定文本
+  拼接（如 version: "0.2.${SKA_BUILD_ID}"）。引用在 step 运行前由 skating 展开，
+  取值来自构建 env / --env / 变量池 / stage env；同一 env 块内的引用链会被跟随；
+  未定义的变量展开为空串。
 
 ## 数据存储
 所有数据存储在 ~/.skating/ 下：

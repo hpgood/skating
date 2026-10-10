@@ -85,12 +85,17 @@ All commands support `--lang zh-CN` for Chinese output.
 
 ### `skating run` options
 
-The project name is optional: `skating run` with no argument runs the `.skating.yaml` in the current directory (ad-hoc mode) and auto-registers the project. The command also supports two flags for selective / parameterized builds:
+The project name is optional: `skating run` with no argument runs the `.skating.yaml` in the current directory (ad-hoc mode) and auto-registers the project. The positional argument also accepts `<project>+<group>` (or `+<group>` for the current directory) to select a group — equivalent to `-g`/`--group`. The command also supports flags for selective / parameterized builds:
+
+```bash
+skating run [project-name[+group]] [flags]
+```
 
 | Flag | Format | Description |
 |---|---|---|
-| `--step`  | `<stage>` or `<stage>/<step>` | Run only the named stage (or single step). Other stages / same-stage siblings are reported as `skipped` in the summary but never execute. |
-| `--env`   | `KEY=VAL` (repeatable) | Inject a custom environment variable into every step of this run. User values **override** the built-in `SKA_BUILD_*` variables. |
+| `--step`, `-s`  | `<stage>` or `<stage>/<step>` | Run only the named stage (or single step). Other stages / same-stage siblings are reported as `skipped` in the summary but never execute. |
+| `--group`, `-g` | `<name>` | Run only the stages in the named group (defined under `pipeline.groups` in `.skating.yaml`). Mutually exclusive with `--step`. |
+| `--env`, `-e`   | `KEY=VAL` (repeatable) | Inject a custom environment variable into every step of this run. User values **override** the built-in `SKA_BUILD_*` variables. |
 
 #### Selective execution with `--step`
 
@@ -100,6 +105,9 @@ skating run myproj --step build
 
 # Run only one step inside a stage; other stages & sibling steps are skipped
 skating run myproj --step build/compile
+
+# -s is the short form of --step (same as above)
+skating run myproj -s build/compile
 
 # Unknown stage → clear error listing known stages
 $ skating run myproj --step nonexistent
@@ -112,11 +120,73 @@ Behavior notes:
 - Step-level filters (`--step build/compile`) preserve the original "stop on first failure" semantic.
 - Multi-stage failure ordering: if the selected stage fails, subsequent stages are still marked `skipped` (not silently dropped) so the summary is complete.
 
+#### Selective execution with `--group`
+
+Define named stage sets under `pipeline.groups` and run one with `--group <name>`
+(short form `-g`), or the positional shorthand `<project>+<group>` / `+<group>`:
+
+```yaml
+name: myproj
+pipeline:
+  groups:
+    all:        [init, build, test]
+    only_build: [build]
+    test:       [test]
+  stages:
+    - name: init
+      # ...
+    - name: build
+      # ...
+    - name: test
+      # ...
+```
+
+```bash
+# Run every stage in the 'all' group
+skating run myproj --group all
+
+# Run only the 'build' stage; the others are reported as skipped
+skating run myproj --group only_build
+
+# -g is the short form of --group (same as above)
+skating run myproj -g only_build
+
+# Positional shorthand: <project>+<group> is equivalent to --group
+skating run myproj+only_build
+
+# ad-hoc: run the current directory project's group (no project name before '+')
+skating run +only_build
+
+# Unknown group → clear error listing known groups
+$ skating run myproj --group nope
+ERROR: group "nope" not found. Known groups: [all only_build test]
+```
+
+Behavior notes:
+- A group is a *set* of stage names: execution order always follows the declaration
+  order in `pipeline.stages`, not the order written inside the group.
+- On the first failing stage the group stops; every remaining (selected) stage is
+  recorded as `skipped`, and the build as a whole still fails.
+- Group entries may only be stage names — for a single step use `--step <stage>/<step>`.
+- Group names and stage names live in different namespaces, so `groups.test` may
+  reference the stage named `test`.
+- The positional `+<group>` form is mutually exclusive with `-g`/`--group` (specifying
+  both is an error) and with `--step`. `--env` combines with either.
+- `+` (not `@`) is the separator because a leading `@` is swallowed by PowerShell
+  (it is parsed as a splat of an undefined variable), which would silently run the
+  full pipeline instead of one group. `+group` needs no quoting in bash/zsh/cmd/PowerShell.
+- A project name containing `+` is not supported (it would be split as a group separator).
+- Every group is validated when the config is loaded: an unknown stage reference is
+  a hard error even if that group is not the one being run.
+
 #### Custom env vars with `--env`
 
 ```bash
 # Inject a single var
 skating run myproj --env DEPLOY_ENV=staging
+
+# -e is the short form of --env (same as above)
+skating run myproj -e DEPLOY_ENV=staging
 
 # Multiple values; later wins on duplicates
 skating run myproj --env DEPLOY_ENV=staging --env REGION=us-west-2
@@ -267,6 +337,26 @@ stages:
 
 Stage env variables are visible to scripts (`${VAR}`) and to `when` conditions.
 
+### Variable interpolation in `env` values
+
+Values in stage/step `env` may reference other variables with `${VAR}` or `$VAR`
+and concatenate them with literal text. References are resolved by skating before
+the step runs, against the already-resolved environment (build env such as
+`SKA_*`, `--env`, the cross-step variable pool, and stage env), so a value can be
+assembled from other variables:
+
+```yaml
+env:
+  default:
+    version: "0.2.${SKA_BUILD_ID}"   # → "0.2.7" for build #7
+```
+
+Resolution is iterative, so a value may reference another variable in the same
+`env` block (chains are followed). Undefined variables expand to an empty string.
+Note the difference from a `script`: `${version}` inside a `script` is expanded by
+the shell at run time, while `${...}` inside an `env` value is expanded by skating
+before the step runs.
+
 ### Custom Shell with `SKA_SHELL`
 
 By default each `shell` step runs with:
@@ -380,6 +470,16 @@ skating run go-project --env SKA_BUILD_ID=999
 
 # Combine: deploy only the release step with a custom target
 skating run node-project --step deploy/release --env DEPLOY_TARGET=canary
+```
+
+Short flags: `-s` = `--step`, `-g` = `--group`, `-e` = `--env` (and the positional
+`<project>+<group>` / `+<group>` shorthand) work the same way:
+
+```bash
+skating run mixed-shell-lua-example -s shell-stage
+skating run go-project -e SKA_BUILD_ID=999
+skating run myproj -g only_build
+skating run myproj+only_build
 ```
 
 See [`examples/mixed-shell-lua/README.md`](./examples/mixed-shell-lua/README.md) for the full worked walkthrough.

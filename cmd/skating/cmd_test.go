@@ -92,6 +92,7 @@ func executeCmd(t *testing.T, args ...string) (stdout, stderr string) {
 	logID = 0
 	initForce = false
 	runStep = ""
+	runGroup = ""
 	runUserEnv = nil
 	// Reset parsed-flag state so subsequent Flag().Parse() doesn't think flags
 	// are already set.
@@ -1096,5 +1097,331 @@ pipeline:
 		if strings.TrimSpace(line) == "::set-var GREETING=hello" {
 			t.Errorf("marker line leaked into log: %q", line)
 		}
+	}
+}
+
+// groupYAML 是 --group 相关测试共用的三 stage 配置：init / build / test，
+// 每个 stage 一个 exit 0 的 shell step（runner 的 [stage/step] success 行会
+// 经 logFn 输出到 stdout，可作为"该 step 确实执行"的证据）。
+const groupYAML = `name: grouptest
+pipeline:
+  groups:
+    all:        [init, build, test]
+    only_build: [build]
+  stages:
+    - name: init
+      steps:
+        - name: init-step
+          type: shell
+          script: |
+            echo "INIT"
+    - name: build
+      steps:
+        - name: build-step
+          type: shell
+          script: |
+            echo "BUILD"
+    - name: test
+      steps:
+        - name: test-step
+          type: shell
+          script: |
+            echo "TEST"
+`
+
+// writeGroupProject 初始化项目目录并写入 groupYAML。
+// 目录名与 yaml 的 name 一致（grouptest），以便 `run grouptest` 命中已注册项目。
+func writeGroupProject(t *testing.T, home string) string {
+	t.Helper()
+	projDir := filepath.Join(home, "grouptest")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(groupYAML), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	return projDir
+}
+
+// TestRun_GroupAll 验证 --group all 会运行组内全部 stage。
+func TestRun_GroupAll(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest", "--group", "all")
+	if stderr != "" {
+		t.Fatalf("run --group all: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	for _, marker := range []string{
+		"[init/init-step] success",
+		"[build/build-step] success",
+		"[test/test-step] success",
+	} {
+		if !strings.Contains(combined, marker) {
+			t.Errorf("expected %q in output: %q", marker, combined)
+		}
+	}
+	if strings.Contains(combined, "skipped") {
+		t.Errorf("no stage should be skipped for --group all: %q", combined)
+	}
+}
+
+// TestRun_GroupSubset 验证 --group only_build 只跑 build，其余记为 skipped。
+func TestRun_GroupSubset(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest", "--group", "only_build")
+	if stderr != "" {
+		t.Fatalf("run --group only_build: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "[build/build-step] success") {
+		t.Errorf("build stage should have run: %q", combined)
+	}
+	for _, skipped := range []string{"[init/init-step] skipped", "[test/test-step] skipped"} {
+		if !strings.Contains(combined, skipped) {
+			t.Errorf("expected %q skipped marker: %q", skipped, combined)
+		}
+	}
+}
+
+// TestRun_GroupUnknown 验证 --group 不存在时列出已知 group。
+func TestRun_GroupUnknown(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	_, stderr := executeCmd(t, "run", "grouptest", "--group", "nope")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for unknown group, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "nope") {
+		t.Errorf("error should mention unknown group 'nope': %q", stderr)
+	}
+	if !strings.Contains(stderr, "only_build") {
+		t.Errorf("error should list known groups (containing 'only_build'): %q", stderr)
+	}
+}
+
+// TestRun_GroupAndStepConflict 验证 --group 与 --step 互斥。
+func TestRun_GroupAndStepConflict(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	_, stderr := executeCmd(t, "run", "grouptest", "--group", "all", "--step", "build")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for conflict, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "--group") || !strings.Contains(stderr, "--step") {
+		t.Errorf("conflict error should mention both flags: %q", stderr)
+	}
+}
+
+// TestRun_GroupShorthandG 验证 -g 是 --group 的短选项，只跑 build。
+func TestRun_GroupShorthandG(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest", "-g", "only_build")
+	if stderr != "" {
+		t.Fatalf("run -g only_build: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "[build/build-step] success") {
+		t.Errorf("build stage should have run: %q", combined)
+	}
+	for _, skipped := range []string{"[init/init-step] skipped", "[test/test-step] skipped"} {
+		if !strings.Contains(combined, skipped) {
+			t.Errorf("expected %q skipped marker: %q", skipped, combined)
+		}
+	}
+}
+
+// TestRun_GroupPlusSyntax 验证位置参数 <project>+<group> 等价于 --group。
+func TestRun_GroupPlusSyntax(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest+only_build")
+	if stderr != "" {
+		t.Fatalf("run grouptest+only_build: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "[build/build-step] success") {
+		t.Errorf("build stage should have run: %q", combined)
+	}
+	for _, skipped := range []string{"[init/init-step] skipped", "[test/test-step] skipped"} {
+		if !strings.Contains(combined, skipped) {
+			t.Errorf("expected %q skipped marker: %q", skipped, combined)
+		}
+	}
+}
+
+// TestRun_GroupPlusAdHoc 验证 +<group> 在 ad-hoc 模式下命中 cwd 项目并只跑 build。
+func TestRun_GroupPlusAdHoc(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home) // 内部已 chdir 到项目目录
+
+	stdout, stderr := executeCmd(t, "run", "+only_build")
+	if stderr != "" {
+		t.Fatalf("run +only_build: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "[build/build-step] success") {
+		t.Errorf("build stage should have run: %q", combined)
+	}
+	for _, skipped := range []string{"[init/init-step] skipped", "[test/test-step] skipped"} {
+		if !strings.Contains(combined, skipped) {
+			t.Errorf("expected %q skipped marker: %q", skipped, combined)
+		}
+	}
+}
+
+// TestRun_GroupPlusConflictWithFlag 验证位置 +group 与 -g/--group 不能同时使用。
+func TestRun_GroupPlusConflictWithFlag(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	_, stderr := executeCmd(t, "run", "grouptest+all", "-g", "only_build")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for duplicate group, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "--group") {
+		t.Errorf("duplicate-group error should mention --group: %q", stderr)
+	}
+	if !strings.Contains(stderr, "twice") && !strings.Contains(stderr, "不能同时使用") {
+		t.Errorf("duplicate-group error should flag duplicate specification: %q", stderr)
+	}
+}
+
+// TestRun_GroupPlusWithStep 验证位置 +group 与 --step 互斥。
+func TestRun_GroupPlusWithStep(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	_, stderr := executeCmd(t, "run", "grouptest+all", "--step", "build")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for +group/--step conflict, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "--group") || !strings.Contains(stderr, "--step") {
+		t.Errorf("conflict error should mention both --group and --step: %q", stderr)
+	}
+}
+
+// TestRun_GroupPlusEmptyGroup 验证 "prj+" 缺少 group 名时报错。
+func TestRun_GroupPlusEmptyGroup(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	_, stderr := executeCmd(t, "run", "grouptest+")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for empty group name, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "group name") && !strings.Contains(stderr, "group 名") {
+		t.Errorf("error should mention missing group name: %q", stderr)
+	}
+	if !strings.Contains(stderr, "grouptest+") {
+		t.Errorf("error should include the offending argument: %q", stderr)
+	}
+}
+
+// TestRun_StepShorthandS 验证 -s 是 --step 的短选项：只跑 build stage，其余 skipped。
+func TestRun_StepShorthandS(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest", "-s", "build")
+	if stderr != "" {
+		t.Fatalf("run -s build: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "[build/build-step] success") {
+		t.Errorf("build stage should have run: %q", combined)
+	}
+	for _, skipped := range []string{"[init/init-step] skipped", "[test/test-step] skipped"} {
+		if !strings.Contains(combined, skipped) {
+			t.Errorf("expected %q skipped marker: %q", skipped, combined)
+		}
+	}
+}
+
+// TestRun_EnvShorthandE 验证 -e 是 --env 的短选项：注入的变量能在 step 里读到。
+func TestRun_EnvShorthandE(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "envshort")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	// echo 变量后 exit 1，让脚本 stdout 通过 error message 冒到 stderr 供断言。
+	yamlContent := `name: envshort
+pipeline:
+  stages:
+    - name: probe
+      steps:
+        - name: dump-env
+          type: shell
+          script: |
+            echo "USER_FOO=${USER_FOO}"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "envshort", "-e", "USER_FOO=hello")
+	combined := stdout + stderr
+	if !strings.Contains(combined, "USER_FOO=hello") {
+		t.Errorf("-e should inject USER_FOO=hello, output: %q", combined)
+	}
+}
+
+// TestRun_StageEnvInterpolation 验证 YAML env 值中的 ${VAR} 会在运行前展开
+// （支持拼接）：stage env version: "0.2.${SKA_BUILD_ID}" 在 build #1 时为 "0.2.1"。
+func TestRun_StageEnvInterpolation(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "envinterp")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	// exit 1 让脚本 stdout 通过 error message 冒到 stderr 供断言。
+	yamlContent := `name: envinterp
+pipeline:
+  stages:
+    - name: build
+      env:
+        default:
+          version: "0.2.${SKA_BUILD_ID}"
+      steps:
+        - name: show
+          type: shell
+          script: |
+            echo "VERSION=${version}"
+            exit 1
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "envinterp")
+	combined := stdout + stderr
+	if !strings.Contains(combined, "VERSION=0.2.1") {
+		t.Errorf("stage env ${SKA_BUILD_ID} not interpolated (want VERSION=0.2.1): %q", combined)
 	}
 }

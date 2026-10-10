@@ -33,6 +33,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	// 1. 创建 .skating.yaml（schema 必须与 internal/pipeline/dsl.go 一致：pipeline.stages[].steps[]）
 	skatingYaml := fmt.Sprintf(`name: %q
 pipeline:
+  groups:
+    all: [build]
   stages:
     - name: build
       parallel: false

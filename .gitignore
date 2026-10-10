@@ -2,4 +2,6 @@
 /.trae
 skating.exe
 Microsoft/Windows/PowerShell/ModuleAnalysisCache
-build/skating.exe~
+build/
+skating0.exe
+.kilo/plans/

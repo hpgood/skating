@@ -3,6 +3,7 @@ package pipeline
 import (
 	"fmt"
 	"maps"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -19,16 +20,38 @@ type Executor interface {
 
 // RunOptions 控制 RunPipeline 的过滤行为。
 //
-//   - StageName == "" 且 StepName == ""：运行完整 pipeline（向后兼容）。
+//   - StageName == "" 且 StepName == "" 且 Stages 为空：运行完整 pipeline
+//     （向后兼容）。
 //   - StageName == "X" 且 StepName == ""：只运行名字为 X 的整个 stage。
 //     其他 stage 在 results 里以 status=skipped 留下记录，便于审计。
 //   - StageName == "X" 且 StepName == "Y"：只运行 X stage 里的 Y step。
 //     其他 stage 和 X 里其他 step 都记为 skipped。
+//   - Stages 非空（“组模式”，--group）：只运行集合内的 stage，执行顺序仍按
+//     pipeline 声明顺序；未选中的 stage 记为 skipped。与 --step 的区别在于
+//     失败语义：组模式下首个失败 stage 之后的（选中的）stage 也记为 skipped
+//     （原因 "skipped after earlier stage failure"），整体返回 error。
 //
 // 不匹配的 stage/step 会记为 status="skipped"，调用方可观察到到底跑了什么。
 type RunOptions struct {
 	StageName string
 	StepName  string
+	// Stages 是 --group 选中的 stage 名集合；非空即“组模式”。
+	Stages map[string]bool
+}
+
+// SelectsStage 判断当前选项是否选中名为 name 的 stage。
+// 除 --group 的 Stages 集合外（组模式）一律返回 true。
+func (o *RunOptions) SelectsStage(name string) bool {
+	if o == nil {
+		return true
+	}
+	if o.StageName != "" {
+		return name == o.StageName
+	}
+	if len(o.Stages) > 0 {
+		return o.Stages[name]
+	}
+	return true
 }
 
 // RunPipeline 按顺序执行 pipeline 的各个 stage。
@@ -42,23 +65,27 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 	if opts == nil {
 		opts = &RunOptions{}
 	}
+	groupMode := len(opts.Stages) > 0
 	var results []*PipelineResult
 	var firstErr error
+	var failedEarlier bool
 
 	for _, stage := range p.Stages {
-		// 阶段级过滤：如果指定了 stage，跳过其他 stage 但记录 skipped 结果
-		if opts.StageName != "" && stage.Name != opts.StageName {
-			for _, step := range stage.Steps {
-				results = append(results, &PipelineResult{
-					StageName: stage.Name,
-					StepName:  step.Name,
-					Status:    "skipped",
-					Output:    "stage not selected by --step filter",
-				})
-				if logFn != nil {
-					logFn(executor.ColorWarn(fmt.Sprintf("[%s/%s] skipped (stage not selected by --step filter)", stage.Name, step.Name)))
-				}
+		// 阶段级过滤：如果指定了 stage（--step <stage>）或组（--group），
+		// 跳过其他 stage 但记录 skipped 结果。
+		if !opts.SelectsStage(stage.Name) {
+			reason := "stage not selected by --step filter"
+			if groupMode {
+				reason = "stage not selected by --group filter"
 			}
+			appendSkippedStage(&results, stage, reason, logFn)
+			continue
+		}
+
+		// 组模式：首个失败 stage 之后的所有剩余 stage 记为 skipped，
+		// 让用户看到"哪些 stage 因前面失败没跑到"。
+		if groupMode && failedEarlier {
+			appendSkippedStage(&results, stage, "skipped after earlier stage failure", logFn)
 			continue
 		}
 
@@ -67,6 +94,8 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 		if err != nil {
 			// step-filter 模式：让剩下的 stage 至少以 skipped 形式出现，
 			// 让用户看到"哪些 stage 因为 filter 没跑到"。
+			// 组模式：记录首个错误并继续遍历，让后续 stage 记为 skipped，
+			// 整体仍返回 error。
 			// 默认模式（opts 为零值）：保留原"遇错即停"语义。
 			if opts.StageName != "" || opts.StepName != "" {
 				// 不立刻 return —— 继续遍历，让后续 stage 至少以 skipped 形式记录。
@@ -76,6 +105,13 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 				}
 				continue
 			}
+			if groupMode {
+				if firstErr == nil {
+					firstErr = err
+				}
+				failedEarlier = true
+				continue
+			}
 			return results, err
 		}
 	}
@@ -83,11 +119,68 @@ func RunPipeline(p *Pipeline, exec Executor, env map[string]string, logFn func(s
 	return results, firstErr
 }
 
+// newSkippedResult 构造一条 status=skipped 的结果记录，统一 skipped 结果形状。
+func newSkippedResult(stageName, stepName, reason string) *PipelineResult {
+	return &PipelineResult{
+		StageName: stageName,
+		StepName:  stepName,
+		Status:    "skipped",
+		Output:    reason,
+	}
+}
+
+// logSkipped 输出可视化的 skip 提示（logFn 为 nil 时静默）。
+func logSkipped(logFn func(string), stageName, stepName, reason string) {
+	if logFn != nil {
+		logFn(executor.ColorWarn(fmt.Sprintf("[%s/%s] skipped (%s)", stageName, stepName, reason)))
+	}
+}
+
+// appendSkippedStage 为 stage 内的每个 step 追加一条 status=skipped 的结果，
+// 并通过 logFn 输出可视化的 skip 提示（logFn 为 nil 时只记录结果）。
+func appendSkippedStage(results *[]*PipelineResult, stage Stage, reason string, logFn func(string)) {
+	for _, step := range stage.Steps {
+		*results = append(*results, newSkippedResult(stage.Name, step.Name, reason))
+		logSkipped(logFn, stage.Name, step.Name, reason)
+	}
+}
+
+// expandEnvValues 对 m 中每个值做 ${VAR} / $VAR 展开，支持与固定文本拼接
+// （如 "0.2.${SKA_BUILD_ID}" → "0.2.7"）。引用优先取 m 内的同名键（支持组内
+// 相互引用），否则取 base（已累积的 env）。未定义的变量展开为空串。
+// 迭代至稳定（上限 len(m) 次）以解析 A→B→C 这类引用链；返回新 map，不改入参。
+func expandEnvValues(m, base map[string]string) map[string]string {
+	if len(m) == 0 {
+		return m
+	}
+	out := maps.Clone(m)
+	for i := 0; i < len(out); i++ {
+		changed := false
+		for k, v := range out {
+			nv := os.Expand(v, func(name string) string {
+				if val, ok := out[name]; ok {
+					return val
+				}
+				return base[name]
+			})
+			if nv != v {
+				out[k] = nv
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return out
+}
+
 func runStage(stage Stage, exec Executor, env map[string]string, logFn func(string), opts *RunOptions, vars *VarPool) ([]*PipelineResult, error) {
 	// 合并 stage 级 env（default + 当前平台组）到本 stage 的 base env：
 	// stage 内所有 step 共享，When 条件同样可见。
 	// 优先级：构建 env < stage env < step env；克隆避免污染共享构建 env。
 	if m := stage.ResolveEnv(runtime.GOOS); len(m) > 0 {
+		m = expandEnvValues(m, env)
 		base := maps.Clone(env)
 		maps.Copy(base, m)
 		env = base
@@ -102,15 +195,8 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 			if step.Name == opts.StepName {
 				kept = append(kept, step)
 			} else {
-				skipped = append(skipped, &PipelineResult{
-					StageName: stage.Name,
-					StepName:  step.Name,
-					Status:    "skipped",
-					Output:    "step not selected by --step filter",
-				})
-				if logFn != nil {
-					logFn(executor.ColorWarn(fmt.Sprintf("[%s/%s] skipped (step not selected by --step filter)", stage.Name, step.Name)))
-				}
+				skipped = append(skipped, newSkippedResult(stage.Name, step.Name, "step not selected by --step filter"))
+				logSkipped(logFn, stage.Name, step.Name, "step not selected by --step filter")
 			}
 		}
 		projected.Steps = kept
@@ -245,9 +331,11 @@ func executeStep(stageName string, step Step, exec Executor, env map[string]stri
 	logFn(fmt.Sprintf("[%s/%s] starting...", stageName, step.Name))
 
 	// 合并 step 级环境变量（default 全平台，windows/linux 等按当前平台注入）。
-	// 克隆一份避免污染共享 env（并行 stage 的多个 step 并发读取同一 map）。
+	// 值中的 ${VAR} / $VAR 会按已累积的 env（构建 env + stage env + 变量池）展开，
+	// 支持拼接（如 "0.2.${SKA_BUILD_ID}"）。克隆避免污染共享 env。
 	stepEnv := env
 	if m := step.ResolveEnv(runtime.GOOS); len(m) > 0 {
+		m = expandEnvValues(m, env)
 		stepEnv = maps.Clone(env)
 		maps.Copy(stepEnv, m)
 	}

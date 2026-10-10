@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -124,7 +125,11 @@ type Config struct {
 
 // PipelineConfig 嵌入到项目配置中的 pipeline 定义
 type PipelineConfig struct {
-	Stages []Stage `yaml:"stages"`
+	// Groups 定义命名 stage 集合（name -> [stage...]），供 `run --group <name>`
+	// 选择性地运行一组 stage。组名与 stage 名处于不同命名空间。
+	// 执行顺序始终按 Stages 的声明顺序，组内书写顺序无影响。
+	Groups map[string][]string `yaml:"groups"`
+	Stages []Stage             `yaml:"stages"`
 }
 
 // DefaultTimeout 未配置 timeout 字段时的默认运行超时
@@ -183,7 +188,50 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("no pipeline stages defined in %s", configPath)
 	}
 
+	if err := validateGroups(cfg.Pipeline.Groups, cfg.Pipeline.Stages); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateGroups 校验 pipeline.groups 的每一项：每个组非空，且组内每个条目
+// 都必须是已声明的 stage 名。组内重复条目按集合语义静默去重。
+// 组名排序遍历，保证错误信息确定性；已知 stage 列表按声明顺序输出。
+func validateGroups(groups map[string][]string, stages []Stage) error {
+	if len(groups) == 0 {
+		return nil
+	}
+
+	stageNames := make([]string, 0, len(stages))
+	known := make(map[string]bool, len(stages))
+	for _, s := range stages {
+		stageNames = append(stageNames, s.Name)
+		known[s.Name] = true
+	}
+
+	for _, g := range slices.Sorted(maps.Keys(groups)) {
+		refs := groups[g]
+		if len(refs) == 0 {
+			return fmt.Errorf("pipeline.groups[%q] is empty", g)
+		}
+		var unknown []string
+		seen := make(map[string]bool, len(refs))
+		for _, r := range refs {
+			if seen[r] {
+				continue
+			}
+			seen[r] = true
+			if !known[r] {
+				unknown = append(unknown, r)
+			}
+		}
+		if len(unknown) > 0 {
+			return fmt.Errorf("pipeline.groups[%q] references unknown stage(s) %v (known stages: %v)", g, unknown, stageNames)
+		}
+	}
+
+	return nil
 }
 
 // LoadPipeline 从 .skating.yaml 中读取 pipeline 配置

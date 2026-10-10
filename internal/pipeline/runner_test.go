@@ -225,6 +225,91 @@ func TestRunPipeline_AllSuccess(t *testing.T) {
 	}
 }
 
+func TestRunPipeline_GroupSelectsSubset(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{
+			{Name: "s1", Steps: []Step{{Name: "a", Type: "shell"}}},
+			{Name: "s2", Steps: []Step{{Name: "b", Type: "shell"}}},
+			{Name: "s3", Steps: []Step{{Name: "c", Type: "shell"}}},
+		},
+	}
+	opts := &RunOptions{Stages: map[string]bool{"s1": true, "s3": true}}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, opts, nil)
+	if err != nil {
+		t.Fatalf("group subset run: %v", err)
+	}
+
+	if _, ran := exec.startTimes["a"]; !ran {
+		t.Error("s1 should have run")
+	}
+	if _, ran := exec.startTimes["b"]; ran {
+		t.Error("s2 should NOT have run (not selected by group)")
+	}
+	if _, ran := exec.startTimes["c"]; !ran {
+		t.Error("s3 should have run")
+	}
+
+	status := map[string]string{}
+	reason := map[string]string{}
+	for _, r := range results {
+		key := r.StageName + "/" + r.StepName
+		status[key] = r.Status
+		reason[key] = r.Output
+	}
+	if status["s1/a"] != "success" || status["s3/c"] != "success" {
+		t.Errorf("selected stages should succeed: %v", status)
+	}
+	if status["s2/b"] != "skipped" {
+		t.Errorf("s2 should be skipped, got %q", status["s2/b"])
+	}
+	if reason["s2/b"] != "stage not selected by --group filter" {
+		t.Errorf("s2 skip reason = %q, want group-filter reason", reason["s2/b"])
+	}
+}
+
+func TestRunPipeline_GroupStopsOnFailure(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.setResult("a", "", fmt.Errorf("a failed"))
+	p := &Pipeline{
+		Stages: []Stage{
+			{Name: "s1", Steps: []Step{{Name: "a", Type: "shell"}}},
+			{Name: "s2", Steps: []Step{{Name: "b", Type: "shell"}}},
+			{Name: "s3", Steps: []Step{{Name: "c", Type: "shell"}}},
+		},
+	}
+	opts := &RunOptions{Stages: map[string]bool{"s1": true, "s2": true, "s3": true}}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, opts, nil)
+	if err == nil {
+		t.Fatal("expected error from failed stage s1")
+	}
+	if _, ran := exec.startTimes["b"]; ran {
+		t.Error("s2 should NOT run after s1 failure")
+	}
+	if _, ran := exec.startTimes["c"]; ran {
+		t.Error("s3 should NOT run after s1 failure")
+	}
+
+	status := map[string]string{}
+	reason := map[string]string{}
+	for _, r := range results {
+		key := r.StageName + "/" + r.StepName
+		status[key] = r.Status
+		reason[key] = r.Output
+	}
+	if status["s1/a"] != "failed" {
+		t.Errorf("s1/a status = %q, want failed", status["s1/a"])
+	}
+	if status["s2/b"] != "skipped" || status["s3/c"] != "skipped" {
+		t.Errorf("stages after failure should be skipped: %v", status)
+	}
+	if reason["s2/b"] != "skipped after earlier stage failure" {
+		t.Errorf("s2 skip reason = %q, want earlier-failure reason", reason["s2/b"])
+	}
+}
+
 func TestStep_ResolveEnv_PlatformGroups(t *testing.T) {
 	step := Step{
 		Name: "compile",
@@ -397,5 +482,62 @@ func TestRunPipeline_StageEnvSharedBySteps(t *testing.T) {
 	// 共享的全局 env 不能被 stage env 污染
 	if _, leaked := globalEnv["version"]; leaked {
 		t.Error("stage env leaked into shared global env")
+	}
+}
+
+// TestExecuteStep_EnvValueInterpolation 验证 step env 值支持 ${VAR}/$VAR 展开与拼接，
+// 引用可来自构建 env、step env 内的其他键（含引用链）。
+func TestExecuteStep_EnvValueInterpolation(t *testing.T) {
+	exec := newFakeExecutor()
+	step := Step{
+		Name: "compile",
+		Env: map[string]map[string]string{
+			"default": {
+				"version": "0.2.${SKA_BUILD_ID}",
+				"label":   "v${version}-${GOOS}",
+			},
+		},
+	}
+	globalEnv := map[string]string{"SKA_BUILD_ID": "7", "GOOS": "linux"}
+
+	result := executeStep("stage", step, exec, globalEnv, func(string) {}, nil)
+	if result.Status != "success" {
+		t.Fatalf("expected success, got %s", result.Status)
+	}
+
+	got := exec.envs["compile"]
+	if got["version"] != "0.2.7" {
+		t.Errorf("version = %q, want 0.2.7", got["version"])
+	}
+	// ${version} 是 step env 内的键，${GOOS} 来自构建 env，需展开后再拼接
+	if got["label"] != "v0.2.7-linux" {
+		t.Errorf("label = %q, want v0.2.7-linux", got["label"])
+	}
+	// 共享的构建 env 不能被污染
+	if _, leaked := globalEnv["version"]; leaked {
+		t.Errorf("step env leaked into shared global env: %v", globalEnv)
+	}
+}
+
+// TestRunPipeline_StageEnvInterpolation 验证 stage 级 env 值支持跨引用构建 env 展开。
+func TestRunPipeline_StageEnvInterpolation(t *testing.T) {
+	exec := newFakeExecutor()
+	pl := &Pipeline{Stages: []Stage{{
+		Name: "build",
+		Env: map[string]map[string]string{
+			"default": {"version": "0.2.${SKA_BUILD_ID}"},
+		},
+		Steps: []Step{{Name: "compile", Type: "shell"}},
+	}}}
+	globalEnv := map[string]string{"SKA_BUILD_ID": "9"}
+
+	if _, err := RunPipeline(pl, exec, globalEnv, func(string) {}, nil, nil); err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+	if got := exec.envs["compile"]["version"]; got != "0.2.9" {
+		t.Errorf("stage env version = %q, want 0.2.9", got)
+	}
+	if _, leaked := globalEnv["version"]; leaked {
+		t.Errorf("stage env leaked into shared global env: %v", globalEnv)
 	}
 }

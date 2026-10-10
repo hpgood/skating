@@ -83,12 +83,17 @@ skating run           # 执行构建（项目名可选 —— 默认当前目录
 
 ### `skating run` 选项
 
-项目名是可选参数：不带参数的 `skating run` 会执行当前目录的 `.skating.yaml`（adhoc 模式）并自动注册项目。此外 `run` 命令支持两个 flag 用于选择性子集 / 参数化构建：
+项目名是可选参数：不带参数的 `skating run` 会执行当前目录的 `.skating.yaml`（adhoc 模式）并自动注册项目。位置参数也支持 `<project>+<group>`（当前目录用 `+<group>`）来选择 group —— 等价于 `-g`/`--group`。此外 `run` 命令支持以下 flag 用于选择性子集 / 参数化构建：
+
+```bash
+skating run [项目名[+group]] [flags]
+```
 
 | Flag | 格式 | 说明 |
 |---|---|---|
-| `--step` | `<stage>` 或 `<stage>/<step>` | 只跑指定 stage（或单个 step）。其他 stage 和同 stage 内其他 step 在 summary 里以 `skipped` 显示，但不会执行。 |
-| `--env`  | `KEY=VAL`（可重复） | 注入自定义环境变量到本次运行的每个 step。用户传入值**优先级高于**内置 `SKA_BUILD_*` 变量。 |
+| `--step`、`-s` | `<stage>` 或 `<stage>/<step>` | 只跑指定 stage（或单个 step）。其他 stage 和同 stage 内其他 step 在 summary 里以 `skipped` 显示，但不会执行。 |
+| `--group`、`-g` | `<name>` | 只跑指定 group 内的 stage（在 `.skating.yaml` 的 `pipeline.groups` 中定义）。与 `--step` 互斥。 |
+| `--env`、`-e`  | `KEY=VAL`（可重复） | 注入自定义环境变量到本次运行的每个 step。用户传入值**优先级高于**内置 `SKA_BUILD_*` 变量。 |
 
 #### 用 `--step` 选择性执行
 
@@ -98,6 +103,9 @@ skating run myproj --step build
 
 # 只跑 build stage 里的 compile 单个 step
 skating run myproj --step build/compile
+
+# -s 是 --step 的短选项（等价于上一行）
+skating run myproj -s build/compile
 
 # 未知 stage → 报错并给出 stage 名单
 $ skating run myproj --step nonexistent
@@ -110,11 +118,67 @@ ERROR: --step "nonexistent" 中 stage "nonexistent" 不存在。已知 stage: [b
 - `--step build/compile`（单个 step）保留原"遇错即停"语义。
 - 多 stage 顺序：选中的 stage 失败时，后续 stage 仍记为 `skipped`（不会悄悄漏掉），summary 完整。
 
+#### 用 `--group` 选择性执行
+
+在 `pipeline.groups` 中定义命名的 stage 集合，用 `--group <name>`（短选项 `-g`）
+或位置参数简写 `<project>+<group>` / `+<group>` 运行其中一个：
+
+```yaml
+name: myproj
+pipeline:
+  groups:
+    all:        [init, build, test]
+    only_build: [build]
+    test:       [test]
+  stages:
+    - name: init
+      # ...
+    - name: build
+      # ...
+    - name: test
+      # ...
+```
+
+```bash
+# 运行 'all' 组内的全部 stage
+skating run myproj --group all
+
+# 只跑 'build' stage；其余 stage 记为 skipped
+skating run myproj --group only_build
+
+# -g 是 --group 的短选项（等价于上一行）
+skating run myproj -g only_build
+
+# 位置参数简写：<project>+<group>，等价于 --group
+skating run myproj+only_build
+
+# ad-hoc：跑当前目录项目（'+' 前无项目名）的 group
+skating run +only_build
+
+# 未知 group → 报错并给出 group 名单
+$ skating run myproj --group nope
+ERROR: --group "nope" 不存在。已知 group: [all only_build test]
+```
+
+行为说明：
+- 组是一组 stage 的*集合*：执行顺序始终按 `pipeline.stages` 的声明顺序，而非组内书写顺序。
+- 遇首个失败 stage 即停止；其后（选中的）剩余 stage 均记为 `skipped`，整体构建仍失败。
+- 组内条目只能是 stage 名 —— 单个 step 请用 `--step <stage>/<step>`。
+- 组名与 stage 名处于不同命名空间，因此 `groups.test` 可指向名为 `test` 的 stage。
+- 位置 `+<group>` 与 `-g`/`--group` 互斥（同时出现报错），也与 `--step` 互斥；`--env` 可与任一组合。
+- 用 `+` 而非 `@` 作分隔符：行首 `@` 在 PowerShell 下被当作未定义变量的 splat 而静默丢弃，
+  会退化成跑全量流水线。`+group` 在 bash/zsh/cmd/PowerShell 下都无需引号。
+- 项目名本身含 `+` 暂不支持（会被当作 group 分隔符切分）。
+- 加载配置时校验**所有**组：即使某个组本次未被使用，引用未知 stage 也会在运行前硬报错。
+
 #### 用 `--env` 注入自定义环境变量
 
 ```bash
 # 注入单个变量
 skating run myproj --env DEPLOY_ENV=staging
+
+# -e 是 --env 的短选项（等价于上一行）
+skating run myproj -e DEPLOY_ENV=staging
 
 # 多个值；同名变量后者覆盖前者
 skating run myproj --env DEPLOY_ENV=staging --env REGION=us-west-2
@@ -265,6 +329,22 @@ stages:
 
 stage env 变量对脚本（`${VAR}`）和 `when` 条件均可见。
 
+### `env` 值支持变量拼接
+
+stage/step `env` 的值可以用 `${VAR}` 或 `$VAR` 引用其他变量并与固定文本拼接。
+引用在 step 运行前由 skating 展开，取值来自已解析的环境（构建 env 如 `SKA_*`、
+`--env`、跨 step 变量池、stage env），因此一个值可以由其他变量拼出来：
+
+```yaml
+env:
+  default:
+    version: "0.2.${SKA_BUILD_ID}"   # build #7 时为 "0.2.7"
+```
+
+展开是迭代进行的，因此值可以引用同一个 `env` 块中的其他键（支持引用链）。
+未定义的变量展开为空串。注意与 `script` 的区别：`script` 里的 `${version}` 由
+shell 在运行时展开，而 `env` 值里的 `${...}` 由 skating 在 step 运行前展开。
+
 ### 用 `SKA_SHELL` 指定脚本执行方式
 
 `shell` step 默认使用的 shell：
@@ -374,6 +454,16 @@ skating run go-project --env SKA_BUILD_ID=999
 
 # 组合使用：只跑 release step 并指定自定义目标
 skating run node-project --step deploy/release --env DEPLOY_TARGET=canary
+```
+
+短选项：`-s` = `--step`、`-g` = `--group`、`-e` = `--env`（以及位置参数
+`<project>+<group>` / `+<group>` 简写）用法完全一致：
+
+```bash
+skating run mixed-shell-lua-example -s shell-stage
+skating run go-project -e SKA_BUILD_ID=999
+skating run myproj -g only_build
+skating run myproj+only_build
 ```
 
 完整演练参见 [`examples/mixed-shell-lua/README.md`](./examples/mixed-shell-lua/README.md)。
