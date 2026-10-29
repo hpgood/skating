@@ -5,6 +5,7 @@
 #   - 根据 SKA_BUILD_ID 决定是否执行某步
 #   - 模拟按分支名决定行为
 #   - 条件表达式为空时始终执行
+#   - stage 级 when: false 整段跳过（构建仍为成功）
 # ============================================
 
 name: conditional-build-example
@@ -49,3 +50,12 @@ pipeline:
             log("=== 无条件步骤 ===")
             local build_id = getenv("SKA_BUILD_ID")
             log("当前构建编号: " .. (build_id or ""))
+
+    # stage 级条件：when: false 整段跳过，steps 均记为 skipped，构建仍为 success
+    - name: disabled-stage
+      when: false
+      steps:
+        - name: disabled-step
+          type: shell
+          script: |
+            echo "=== 此步骤不会执行 ==="

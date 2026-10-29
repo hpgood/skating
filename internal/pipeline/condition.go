@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"maps"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -9,12 +10,20 @@ import (
 
 // EvalWhen 计算条件表达式。
 // 支持的操作符：==, !=, >, <, >=, <=
+// 布尔字面量 true / false（大小写不敏感）直接返回对应结果。
 // $VAR 形式的变量从 env 解析，普通标识符从 ctx 解析。
 // 空字符串表示无条件，始终返回 true。
 func EvalWhen(condition string, env map[string]string, ctx map[string]string) (bool, error) {
 	condition = strings.TrimSpace(condition)
 	if condition == "" {
 		return true, nil
+	}
+
+	switch strings.ToLower(condition) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
 	}
 
 	ops := []string{">=", "<=", "!=", "==", ">", "<"}
@@ -39,6 +48,31 @@ func EvalWhen(condition string, env map[string]string, ctx map[string]string) (b
 	rightVal := resolveVar(right, env, ctx)
 
 	return compare(leftVal, op, rightVal)
+}
+
+// evalWhenWithEnv 在 env 视图上补齐 git 上下文后求值条件，仅供 stage 级 when 使用。
+// 空串与布尔字面量走 fast path，不触发 git 调用；否则克隆 env 再注入缺失的
+// git 上下文键（branch / commit / git_dirty），避免污染共享构建 env。
+// step 级 executeStep 保留原有的内联 git 上下文合并逻辑。
+func evalWhenWithEnv(condition string, env map[string]string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(condition)) {
+	case "", "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+
+	view := maps.Clone(env)
+	if view == nil {
+		view = map[string]string{}
+	}
+	ctx := BuildGitContext("")
+	for k, v := range ctx {
+		if _, exists := view[k]; !exists {
+			view[k] = v
+		}
+	}
+	return EvalWhen(condition, view, ctx)
 }
 
 func resolveVar(s string, env, ctx map[string]string) string {

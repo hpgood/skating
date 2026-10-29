@@ -3,6 +3,7 @@ package pipeline
 import (
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -539,5 +540,259 @@ func TestRunPipeline_StageEnvInterpolation(t *testing.T) {
 	}
 	if _, leaked := globalEnv["version"]; leaked {
 		t.Errorf("stage env leaked into shared global env: %v", globalEnv)
+	}
+}
+
+// resultsByKey 把结果按 stage/step 建索引，便于断言状态与跳过原因。
+func resultsByKey(results []*PipelineResult) (map[string]string, map[string]string) {
+	status := map[string]string{}
+	reason := map[string]string{}
+	for _, r := range results {
+		key := r.StageName + "/" + r.StepName
+		status[key] = r.Status
+		reason[key] = r.Output
+	}
+	return status, reason
+}
+
+func TestRunPipeline_StageWhenFalseSkipsStage(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{{
+			Name: "deploy",
+			When: "false",
+			Steps: []Step{
+				{Name: "push", Type: "shell"},
+				{Name: "notify", Type: "shell"},
+			},
+		}},
+	}
+	globalEnv := map[string]string{"SKA_BUILD_ID": "1"}
+
+	results, err := RunPipeline(p, exec, globalEnv, func(string) {}, nil, nil)
+	if err != nil {
+		t.Fatalf("disabled stage should not fail the build: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected one result per step, got %d", len(results))
+	}
+	status, reason := resultsByKey(results)
+	for _, key := range []string{"deploy/push", "deploy/notify"} {
+		if status[key] != "skipped" {
+			t.Errorf("%s status = %q, want skipped", key, status[key])
+		}
+		if reason[key] != "stage condition not met" {
+			t.Errorf("%s reason = %q, want %q", key, reason[key], "stage condition not met")
+		}
+	}
+	if len(exec.startTimes) != 0 {
+		t.Errorf("no step should execute, got %v", exec.startTimes)
+	}
+	// 共享构建 env 不能被 stage when 求值污染
+	if _, leaked := globalEnv["branch"]; leaked {
+		t.Errorf("git context leaked into shared env: %v", globalEnv)
+	}
+}
+
+func TestRunPipeline_StageWhenTrueRunsSteps(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{{
+			Name:  "build",
+			When:  "TRUE",
+			Steps: []Step{{Name: "compile", Type: "shell"}},
+		}},
+	}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, nil, nil)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+	if results[0].Status != "success" {
+		t.Errorf("status = %q, want success", results[0].Status)
+	}
+	if _, ran := exec.startTimes["compile"]; !ran {
+		t.Error("compile should have run")
+	}
+}
+
+func TestRunPipeline_StageWhenExpression(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{
+			{
+				Name: "windows-only",
+				When: "SKA_OS == windows",
+				Env:  map[string]map[string]string{"default": {"SKA_OS": "linux"}},
+				Steps: []Step{
+					{Name: "a", Type: "shell"},
+				},
+			},
+			{
+				Name: "stage-env-visible",
+				When: `version == "0.2.1"`,
+				Env:  map[string]map[string]string{"default": {"version": "0.2.1"}},
+				Steps: []Step{
+					{Name: "b", Type: "shell"},
+				},
+			},
+		},
+	}
+	globalEnv := map[string]string{"SKA_OS": "windows"}
+
+	results, err := RunPipeline(p, exec, globalEnv, func(string) {}, nil, nil)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+	status, _ := resultsByKey(results)
+	// stage env 覆盖构建 env，条件因此不成立
+	if status["windows-only/a"] != "skipped" {
+		t.Errorf("windows-only/a = %q, want skipped", status["windows-only/a"])
+	}
+	if status["stage-env-visible/b"] != "success" {
+		t.Errorf("stage-env-visible/b = %q, want success", status["stage-env-visible/b"])
+	}
+}
+
+func TestRunPipeline_StageWhenSeesVarPool(t *testing.T) {
+	exec := newFakeExecutor()
+	pool := NewVarPool()
+	pool.Set("deploy_target", "prod")
+	p := &Pipeline{
+		Stages: []Stage{
+			{Name: "build", Steps: []Step{{Name: "compile", Type: "shell"}}},
+			{
+				Name:  "deploy",
+				When:  `deploy_target == "prod"`,
+				Steps: []Step{{Name: "push", Type: "shell"}},
+			},
+		},
+	}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, nil, pool)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+	status, _ := resultsByKey(results)
+	if status["deploy/push"] != "success" {
+		t.Errorf("deploy/push = %q, want success (var pool not visible)", status["deploy/push"])
+	}
+}
+
+func TestRunPipeline_StageWhenEvalError(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{{
+			Name: "deploy",
+			When: "garbage no operator",
+			Steps: []Step{
+				{Name: "push", Type: "shell"},
+				{Name: "notify", Type: "shell"},
+			},
+		}},
+	}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid stage when condition")
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected one result per step, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.Status != "failed" {
+			t.Errorf("%s/%s status = %q, want failed", r.StageName, r.StepName, r.Status)
+		}
+		if !strings.Contains(r.Error, "eval stage when") {
+			t.Errorf("%s/%s error = %q, want eval stage when prefix", r.StageName, r.StepName, r.Error)
+		}
+	}
+	if len(exec.startTimes) != 0 {
+		t.Errorf("no step should execute, got %v", exec.startTimes)
+	}
+}
+
+func TestRunPipeline_GroupContinuesAfterDisabledStage(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{
+			{Name: "s1", Steps: []Step{{Name: "a", Type: "shell"}}},
+			{Name: "s2", When: "false", Steps: []Step{{Name: "b", Type: "shell"}}},
+			{Name: "s3", Steps: []Step{{Name: "c", Type: "shell"}}},
+		},
+	}
+	opts := &RunOptions{Stages: map[string]bool{"s1": true, "s2": true, "s3": true}}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, opts, nil)
+	if err != nil {
+		t.Fatalf("disabled stage should not fail the group run: %v", err)
+	}
+	status, _ := resultsByKey(results)
+	if status["s1/a"] != "success" || status["s3/c"] != "success" {
+		t.Errorf("stages around disabled one should run: %v", status)
+	}
+	if status["s2/b"] != "skipped" {
+		t.Errorf("s2/b = %q, want skipped", status["s2/b"])
+	}
+	if _, ran := exec.startTimes["b"]; ran {
+		t.Error("disabled stage step should not run")
+	}
+}
+
+func TestRunPipeline_StepFilterCannotBypassStageWhen(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{{
+			Name: "deploy",
+			When: "false",
+			Steps: []Step{
+				{Name: "push", Type: "shell"},
+				{Name: "notify", Type: "shell"},
+			},
+		}},
+	}
+	opts := &RunOptions{StageName: "deploy", StepName: "push"}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, opts, nil)
+	if err != nil {
+		t.Fatalf("disabled stage should not fail the build: %v", err)
+	}
+	status, _ := resultsByKey(results)
+	if status["deploy/push"] != "skipped" {
+		t.Errorf("deploy/push = %q, want skipped", status["deploy/push"])
+	}
+	if len(exec.startTimes) != 0 {
+		t.Errorf("no step should execute, got %v", exec.startTimes)
+	}
+}
+
+func TestRunPipeline_ParallelStageWhenFalseStartsNoGoroutines(t *testing.T) {
+	exec := newFakeExecutor()
+	p := &Pipeline{
+		Stages: []Stage{{
+			Name:     "parallel-deploy",
+			Parallel: true,
+			When:     "false",
+			Steps: []Step{
+				{Name: "a", Type: "shell"},
+				{Name: "b", Type: "shell"},
+			},
+		}},
+	}
+
+	results, err := RunPipeline(p, exec, nil, func(string) {}, nil, nil)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.Status != "skipped" {
+			t.Errorf("%s status = %q, want skipped", r.StepName, r.Status)
+		}
+	}
+	if len(exec.startTimes) != 0 {
+		t.Errorf("no step should execute, got %v", exec.startTimes)
 	}
 }

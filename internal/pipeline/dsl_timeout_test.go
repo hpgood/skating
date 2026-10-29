@@ -72,6 +72,39 @@ func TestLoadConfigInvalidTimeout(t *testing.T) {
 	}
 }
 
+// ParseDuration 与 yaml timeout 字段共用解析规则：duration 字符串或纯数字（秒）。
+func TestParseDuration(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{in: "10m", want: 10 * time.Minute},
+		{in: "600s", want: 600 * time.Second},
+		{in: "600", want: 600 * time.Second},
+		{in: " 90s ", want: 90 * time.Second},
+		{in: "1h30m", want: 90 * time.Minute},
+		{in: "notaduration", wantErr: true},
+		{in: "", wantErr: true},
+	}
+	for _, tc := range cases {
+		got, err := ParseDuration(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("ParseDuration(%q) = %v, want error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseDuration(%q) unexpected error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ParseDuration(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 // step 级 image/docker_options 解析
 func TestLoadConfigStepImageAndDockerOptions(t *testing.T) {
 	yaml := `name: a

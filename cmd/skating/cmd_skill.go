@@ -68,24 +68,49 @@ Options:
   Project names containing '+' are not supported.
 - --env KEY=VAL (short: -e): inject custom env into steps. Repeatable; later
   values win; on conflict user values override skating system env (SKA_*)
+- --timeout <dur>: override the run timeout for this invocation. Accepts a Go
+  duration ("10m"/"600s") or plain seconds ("600"). Takes precedence over the
+  top-level timeout field in .skating.yaml; when unset, the config value is used,
+  falling back to 10m. On timeout, running subprocesses are terminated and the
+  build is reported as timeout.
 Workflow:
 1. Load project (registry or ad-hoc) and read .skating.yaml from the project path
 2. Increment and inject SKA_BUILD_ID (plus SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE,
    SKA_GIT_COMMIT_ID, SKA_OS); SKA_GIT_BRANCH is refreshed before each step runs
 3. Execute stages sequentially; within a stage with parallel=true, run steps concurrently
-4. For each step: evaluate the When condition (if any), merge stage-level env
+4. For each stage: evaluate the stage-level When condition (if any) after stage env
+   is merged; false skips the whole stage (all steps recorded as skipped, build
+   still succeeds) before any step filter or goroutine starts
+5. For each step: evaluate the When condition (if any), merge stage-level env
    then step-level env (both platform-aware; step overrides stage on conflicts),
    then dispatch to the shell, lua, ssh, scp or sync executor
-5. Stream output to the terminal line-by-line and buffer it for log persistence
-6. Save log to ~/.skating/logs/<project>/<buildID>.log (plain text, ANSI stripped)
-7. Update project status and timestamp in projects.yaml
-8. Run all registered plugins (builtin ConsoleNotifier + user Yaegi plugins)
-9. Print build summary with per-step status, icon, and duration
+6. Stream output to the terminal line-by-line and buffer it for log persistence
+7. Save log to ~/.skating/logs/<project>/<buildID>.log (plain text, ANSI stripped)
+8. Update project status and timestamp in projects.yaml
+9. Run all registered plugins (builtin ConsoleNotifier + user Yaegi plugins)
+10. Print build summary with per-step status, icon, and duration
 
 ### skating config [project]
 Display the .skating.yaml configuration for a project. The name is optional —
 it defaults to the project in the current directory (name from .skating.yaml,
 falling back to the directory name). The same rule applies to logs and clean.
+
+### skating groups [project]
+List the groups defined under pipeline.groups with their stages and descriptions.
+- The project name is optional: without it the .skating.yaml in the current
+  directory is used, and the project does not need to be registered
+- Read-only: loads and validates the config, then prints a GROUP / STAGES /
+  DESCRIPTION table sorted by group name
+- An empty description is shown as "-"; stage lists are joined with ", "
+
+### skating stages [project]
+List the stages declared under pipeline.stages with their descriptions.
+- The project name is optional: without it the .skating.yaml in the current
+  directory is used, and the project does not need to be registered
+- Read-only: loads and validates the config, then prints a STAGE / DESCRIPTION
+  table in declaration order (which is also the execution order)
+- An empty description is shown as "-"; description is display-only and is
+  ignored by run
 
 ### skating logs [project]
 View build logs.
@@ -96,6 +121,27 @@ View build logs.
 ### skating clean [project]
 Clear build log files for a project (defaults to the current directory project).
 BuildID counter and project registry are preserved. --all clears logs for all projects.
+
+### skating stats
+Show in-progress tasks with live progress. Keeps refreshing every 2s; add --once to
+render a single snapshot and exit.
+- --all: also list recent finished records
+- --prune: delete "stale" (zombie) records. A record becomes stale when its
+  heartbeat stops for >15s, which happens when a skating process dies without
+  finishing (kill -9, OOM, power loss, killed container). Stale records do NOT
+  occupy a concurrency slot — they are excluded from the max_tasks gate, so new
+  builds are not blocked — but they keep appearing in the list until pruned or
+  auto-removed (7 days). The "Concurrency: N/M" headline counts only live running
+  tasks, not stale ones.
+
+### skating stop [project-name] <build-id>
+Stop a running build on this host, or clean a stale (zombie) record whose process is
+already gone. Project name is optional (defaults to the current directory).
+- running with a fresh heartbeat -> terminate the process (SIGTERM then SIGKILL on
+  Unix; taskkill /T /F on Windows) and mark the record stopped
+- heartbeat timed out (stale / process exited) -> delete the zombie record
+- already finished (success/failure/timeout/stopped) -> nothing to do
+Use skating stats to find the PROJECT and BUILD# first.
 
 ### skating secret set/list/delete
 Manage global secrets (ssh passwords / private keys) stored in
@@ -128,12 +174,18 @@ Output this SKILL document. Use --lang zh-CN for Chinese.
 ### Full Schema
 ` + "```yaml" + `
 name: project-name          # Project identifier
+timeout: 10m                # Run timeout (Go duration or seconds; default 10m,
+                            # overridable with skating run --timeout)
 pipeline:
   groups:                   # Named stage sets for skating run --group/-g <name>
-    all:        [init, build, test]
-    only_build: [build]
+    all:                    # Mapping form: stages (required) + description (optional)
+      stages: [init, build, test]
+      description: "Full pipeline"
+    only_build: [build]     # List shorthand still works (description is empty)
   stages:
     - name: stage-name
+      description: "Compile all platform binaries"  # Display-only (skating stages)
+      when: "branch == main"  # Optional stage condition; false skips the stage
       parallel: false       # If true, run all steps in this stage concurrently
       env:                  # Stage-level env, shared by all steps in the stage
         default:            # (optional; same grouping rules as step env:
@@ -191,7 +243,8 @@ pipeline:
   where the project directory is mounted; default "/work". For ssh steps: remote
   cd directory (no default, supports ${VAR} expansion). A leading "/" is added
   automatically for docker (e.g. "cache" becomes "/cache").
-- when: Conditional expression. Step is skipped if false. Empty/absent means always run.
+- when: Conditional expression or boolean literal (true/false, case-insensitive).
+  Step is skipped if false. Empty/absent means always run.
 - env: (optional) Step-level environment variables grouped by platform. Group key
   "default" applies on every platform; other keys (windows/linux/darwin...) apply
   when the key matches the runtime GOOS. Platform groups override same-name
@@ -217,6 +270,14 @@ pipeline:
 
 ### Stage Fields
 - name: (required) Stage name
+- description: (optional) Single-line description shown by "skating stages";
+  display-only — it never affects execution, group validation, or env resolution
+- when: (optional) Stage-level condition using the same syntax as step when:
+  boolean literal true/false or a comparison expression. When false the whole
+  stage is skipped (every step recorded as skipped, reason "stage condition not
+  met") and the build still succeeds. Evaluated after stage env is merged and
+  before step filtering, so --step cannot bypass it. An invalid expression fails
+  every step of the stage and the build.
 - parallel: (optional, default false) Run all steps concurrently
 - steps: (required) Ordered list of Step objects
 - env: (optional) Stage-level environment variables grouped by platform, shared
@@ -226,6 +287,9 @@ pipeline:
 
 ### Step Execution Rules
 - Stages run sequentially; a failing stage stops the entire pipeline
+- A stage when condition is evaluated before any step runs: false skips the whole
+  stage (steps recorded as skipped) without failing the build; an invalid
+  expression fails every step of the stage
 - Within a serial stage, steps run in order; a failing step stops the stage
 - Within a parallel stage, all steps start concurrently; first failure is reported after all complete
 - With --step filtering, stages/steps not selected are recorded as skipped (visible
@@ -426,6 +490,11 @@ Returns the destination absolute path on success, or empty string + error messag
 
 ## When Conditions
 Condition expressions support the following operators: ==, !=, >, <, >=, <=
+Boolean literals are also accepted (stage-level and step-level when):
+- true  (or TRUE / True): always run
+- false (or FALSE / False): skip the step, or the whole stage (every step
+  recorded as skipped with reason "stage condition not met"; the build still
+  succeeds)
 
 Variable resolution:
 - $VAR_NAME: resolved from environment variables (e.g., $SKA_BUILD_ID)
@@ -574,23 +643,42 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
   '+' 而非 '@'（行首 '@' 会被 PowerShell 静默丢弃）。项目名本身含 '+' 不支持。
 - --env KEY=VAL（短选项 -e）：向 step 注入自定义环境变量。可重复传入，后者覆盖前者；
   与系统 SKA_* 变量冲突时用户值优先
+- --timeout <dur>：覆盖本次运行的超时时间。接受 Go duration（"10m"/"600s"）或
+  纯秒数（"600"）。优先级高于 .skating.yaml 顶层的 timeout 字段；未指定时使用
+  配置值，缺省 10m。超时后正在运行的子进程会被终止，构建状态记为 timeout。
 工作流：
 1. 加载项目（注册表或 adhoc），从项目路径读取 .skating.yaml
 2. 递增并注入 SKA_BUILD_ID（同时注入 SKA_BUILD_TIMESTAMP / SKA_BUILD_DATE / SKA_GIT_COMMIT_ID / SKA_OS）；
    SKA_GIT_BRANCH 在每个 step 运行前刷新注入
 3. 按顺序执行各 Stage；若 Stage 设置 parallel=true，则并发执行其中的 Steps
-4. 对每个 Step：先评估 When 条件（如有），再合并 stage 级 env 与 step 级 env
-   （均按平台解析；同名变量 step 覆盖 stage），
-   最后分发到 shell、lua、ssh、scp 或 sync 执行器
-5. 输出按行实时流式转发到终端，同时缓冲用于日志持久化
-6. 将日志保存到 ~/.skating/logs/<项目名>/<buildID>.log（纯文本，已剥离 ANSI）
-7. 更新 projects.yaml 中的项目状态和时间戳
-8. 运行所有已注册插件（内置 ConsoleNotifier + 用户 Yaegi 插件）
-9. 打印构建摘要，包含每个 Step 的状态、图标和耗时
+4. 对每个 Stage：先合并 stage 级 env，再评估 stage 级 When 条件（如有）；为 false
+   时整段跳过（所有 Step 记为 skipped，构建仍为成功），且不会启动任何 Step 过滤或
+   goroutine
+5. 对每个 Step：评估 When 条件（如有），再合并 step 级 env（按平台解析；
+   同名变量 step 覆盖 stage），最后分发到 shell、lua、ssh、scp 或 sync 执行器
+6. 输出按行实时流式转发到终端，同时缓冲用于日志持久化
+7. 将日志保存到 ~/.skating/logs/<项目名>/<buildID>.log（纯文本，已剥离 ANSI）
+8. 更新 projects.yaml 中的项目状态和时间戳
+9. 运行所有已注册插件（内置 ConsoleNotifier + 用户 Yaegi 插件）
+10. 打印构建摘要，包含每个 Step 的状态、图标和耗时
 
 ### skating config [项目名]
 显示项目的 .skating.yaml 配置内容。项目名可选——默认取当前目录对应的项目
 （读 .skating.yaml 的 name，缺省用目录名）。logs 和 clean 同规则。
+
+### skating groups [项目名]
+列出 pipeline.groups 中定义的 group、包含的 stage 及说明。
+- 项目名可选：不传时读取当前目录的 .skating.yaml，且不要求项目已注册
+- 只读命令：加载并校验配置后输出 GROUP / STAGES / DESCRIPTION 表格，
+  group 名按字母序排序
+- 空 description 显示为 "-"；stage 列表用 ", " 连接
+
+### skating stages [项目名]
+列出 pipeline.stages 中声明的 stage 及其说明。
+- 项目名可选：不传时读取当前目录的 .skating.yaml，且不要求项目已注册
+- 只读命令：加载并校验配置后输出 STAGE / DESCRIPTION 表格，顺序为声明顺序
+  （也就是执行顺序）
+- 空 description 显示为 "-"；description 仅用于展示，run 会忽略
 
 ### skating logs [项目名]
 查看构建日志。
@@ -601,6 +689,24 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 ### skating clean [项目名]
 清空项目的构建日志文件（默认当前目录对应的项目）。BuildID 计数器和项目注册信息保持不变。
 --all 清空所有项目的日志。
+
+### skating stats
+显示正在运行的任务及实时进度。默认每 2s 刷新；加 --once 只输出一次后退出。
+- --all：附带最近的历史终态记录
+- --prune：清理 stale（僵尸）记录。当任务的进程未正常结束（kill -9、OOM、
+  断电、容器被杀）时心跳停止，超过 15s 后该记录变为 stale。stale 记录不占用
+  并发槽位（不参与 max_tasks 闸门，新构建不会被阻塞），但会一直显示在列表中，
+  直到被清理或 7 天后自动删除。Concurrency: N/M 只统计真正运行的 running 任务，
+  不含 stale。
+
+### skating stop [项目名] <build-id>
+停止本机正在运行的构建，或清理进程已退出的 stale（僵尸）记录。项目名可选
+（默认取当前目录）。
+- running 且心跳新鲜 → 终止进程（Unix 先 SIGTERM 再 SIGKILL；Windows 用
+  taskkill /T /F），记录标记为 stopped
+- 心跳超时（stale / 进程已退出）→ 直接删除僵尸记录
+- 已结束（success/failure/timeout/stopped）→ 无需处理
+先用 skating stats 查看 PROJECT 与 BUILD#。
 
 ### skating secret set/list/delete
 管理全局 secret（SSH 密码/私钥），存储在 ~/.skating/secrets.json（文件权限
@@ -632,12 +738,18 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 ### 完整 Schema
 ` + "```yaml" + `
 name: project-name          # 项目标识
+timeout: 10m                # 运行超时（Go duration 或秒数；默认 10m，
+                            # 可用 skating run --timeout 覆盖）
 pipeline:
   groups:                   # 命名 stage 集合，供 skating run --group/-g <name> 使用
-    all:        [init, build, test]
-    only_build: [build]
+    all:                    # mapping 形式：stages 必填，description 可选
+      stages: [init, build, test]
+      description: "完整流水线"
+    only_build: [build]     # 仍支持列表简写（description 为空）
   stages:
     - name: stage-name
+      description: "编译各平台二进制"  # 仅用于展示（skating stages）
+      when: "branch == main"  # 可选 stage 条件；false 时整段跳过
       parallel: false       # 若为 true，该 Stage 内的 Steps 并发执行
       env:                  # stage 级环境变量，该 Stage 内所有 Steps 共享
         default:            # （可选；分组规则与 step env 相同：
@@ -692,7 +804,8 @@ pipeline:
 - workdir：（可选）配置了 image 的 shell 步骤：项目目录挂载到的容器内工作
   目录，默认 "/work"；SSH 步骤：远端 cd 目录（无默认值，支持 ${VAR} 展开）。
   docker 场景不以 / 开头时自动补前缀（如 "cache" 等价 "/cache"）
-- when：条件表达式。若为 false 则跳过该 Step。为空或未设置表示始终执行
+- when：条件表达式或布尔字面量（true/false，大小写不敏感）。若为 false 则跳过
+  该 Step。为空或未设置表示始终执行
 - env：（可选）step 级环境变量，按平台分组。分组键 "default" 对所有平台生效；
   其余键（windows/linux/darwin...）仅在键名等于当前 GOOS 时生效；
   平台组覆盖 default 中同名变量
@@ -715,6 +828,13 @@ pipeline:
 
 ### Stage 字段说明
 - name：（必填）Stage 名称
+- description：（可选）单行说明，由 "skating stages" 展示；仅用于展示，
+  不影响执行、分组校验或环境变量解析
+- when：（可选）stage 级条件，语法与 step 的 when 相同：布尔字面量 true/false
+  或比较表达式。为 false 时整段跳过（每个 Step 记为 skipped，原因为
+  "stage condition not met"），构建仍为成功。在 stage env 合并之后、step 过滤
+  之前求值，因此 --step 无法绕过。表达式非法时该 Stage 所有 Step 记为 failed
+  且构建失败
 - parallel：（可选，默认 false）是否并发执行该 Stage 内的所有 Steps
 - steps：（必填）Step 对象的有序列表
 - env：（可选）stage 级环境变量，按平台分组，该 Stage 内所有 Steps 共享
@@ -724,6 +844,8 @@ pipeline:
 
 ### 执行规则
 - Stage 按顺序执行；失败的 Stage 会终止整个流水线
+- stage 级 when 条件在任何 Step 运行前求值：为 false 时整段跳过（Steps 记为
+  skipped）且不使构建失败；表达式非法时该 Stage 所有 Step 记为 failed
 - 串行 Stage 中，Steps 按顺序执行；失败的 Step 会终止该 Stage
 - 并行 Stage 中，所有 Steps 同时启动；所有完成后报告首个失败
 - 使用 --step 过滤时，未选中的 stage/step 记为 skipped（在摘要中可见）；
@@ -909,6 +1031,10 @@ set_env("CUSTOM_VAR", "value")
 
 ## When 条件
 条件表达式支持以下运算符：==、!=、>、<、>=、<=
+stage 级与 step 级 when 均支持布尔字面量：
+- true（或 TRUE、True）：始终执行
+- false（或 FALSE、False）：跳过该 Step；stage 级则为整段跳过（每个 Step 记为
+  skipped，原因为 "stage condition not met"），构建仍为成功
 
 变量解析：
 - $变量名：从环境变量解析（如 $SKA_BUILD_ID）

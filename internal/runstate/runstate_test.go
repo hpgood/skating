@@ -145,6 +145,115 @@ func TestStaleRecord(t *testing.T) {
 	}
 }
 
+// PruneStale 只删除心跳过期的僵尸记录，正常 running 与终态记录保留
+func TestPruneStale(t *testing.T) {
+	useTempBase(t)
+
+	// 1) 心跳过期 1 小时的残留（僵尸）
+	zombie, _ := Open("legacy", 9)
+	zs := zombie.st
+	zs.Status = StatusRunning
+	zs.StartTime = time.Now().Add(-time.Hour)
+	zs.LastUpdate = time.Now().Add(-time.Hour)
+	putState(t, zs)
+
+	// 2) 正常的 running 记录（心跳新鲜）
+	fresh, _ := Open("app", 1)
+	if err := fresh.Acquire(10); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// 3) 终态记录
+	fin, _ := Open("app", 2)
+	fs := fin.st
+	fs.Status = StatusSuccess
+	fs.LastUpdate = time.Now()
+	putState(t, fs)
+
+	removed, err := PruneStale()
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	states, err := Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findState(states, zombie.id) != nil {
+		t.Errorf("zombie record should have been pruned")
+	}
+	if findState(states, fresh.id) == nil {
+		t.Errorf("fresh running record should be kept")
+	}
+	if findState(states, fin.id) == nil {
+		t.Errorf("finished record should be kept")
+	}
+}
+
+// IsStale 判定：新鲜的 running 不算僵尸；心跳过期的 running 与已标记 stale 的算；
+// 终态记录不算。
+func TestIsStale(t *testing.T) {
+	now := time.Now()
+	if IsStale(State{Status: StatusRunning, LastUpdate: now}) {
+		t.Error("fresh running should not be stale")
+	}
+	if !IsStale(State{Status: StatusRunning, LastUpdate: now.Add(-time.Hour)}) {
+		t.Error("old running should be stale")
+	}
+	if !IsStale(State{Status: StatusStale, LastUpdate: now}) {
+		t.Error("stale status should be stale")
+	}
+	if IsStale(State{Status: StatusSuccess, LastUpdate: now.Add(-time.Hour)}) {
+		t.Error("finished record should not be stale")
+	}
+}
+
+// LocalState / SetStatus / DeleteRecord 基本行为
+func TestLocalStateSetStatusDelete(t *testing.T) {
+	useTempBase(t)
+
+	tr, _ := Open("app", 7)
+	tr.st.Status = StatusRunning
+	tr.st.StartTime = time.Now().Add(-time.Hour)
+	tr.st.LastUpdate = time.Now().Add(-time.Hour)
+	putState(t, tr.st)
+
+	got, err := LocalState("app", 7)
+	if err != nil {
+		t.Fatalf("LocalState: %v", err)
+	}
+	if got.ID != tr.id || got.Project != "app" || got.BuildID != 7 {
+		t.Fatalf("unexpected record: %+v", got)
+	}
+
+	if _, err := LocalState("app", 999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing record should return ErrNotFound, got %v", err)
+	}
+
+	if err := SetStatus(tr.id, StatusStopped); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	if got, _ := LocalState("app", 7); got.Status != StatusStopped {
+		t.Fatalf("status = %q, want stopped", got.Status)
+	}
+
+	if err := DeleteRecord(tr.id); err != nil {
+		t.Fatalf("DeleteRecord: %v", err)
+	}
+	if _, err := LocalState("app", 7); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("record should be deleted, got %v", err)
+	}
+	if err := DeleteRecord(tr.id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing should return ErrNotFound, got %v", err)
+	}
+	if err := SetStatus(tr.id, StatusStopped); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("set status on missing should return ErrNotFound, got %v", err)
+	}
+}
+
 // putState 直接写库（绕过 flush 的时间戳刷新），测试用
 func putState(t *testing.T, st State) {
 	t.Helper()

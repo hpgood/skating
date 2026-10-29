@@ -1,11 +1,22 @@
 name: "skating"
+timeout: 10m
 pipeline:
   groups:
-    all:        [init, build, test]
-    only_build: [build]
-    test:       [test]
+    all:
+      stages: [init, build, test, deploy]
+      description: "完整流水线：初始化、构建、测试、部署"
+    build:
+      stages: [build]
+      description: "编译各平台二进制"
+    test:
+      stages: [test]
+      description: "运行测试"
+    deploy:
+      stages: [deploy]
+      description: "部署到远端服务器"
   stages:
     - name: init
+      description: "初始化构建环境"
       parallel: false
       steps:
         - name: init
@@ -16,6 +27,7 @@ pipeline:
             echo "SKA_GIT_BRANCH=${SKA_GIT_BRANCH}"
             echo "SKA_BUILD_DATE=${SKA_BUILD_DATE}"
     - name: build
+      description: "构建各平台二进制"
       parallel: false
       env:
         default:
@@ -61,6 +73,27 @@ pipeline:
             echo "SKA_GIT_BRANCH=${SKA_GIT_BRANCH}"
             go build -ldflags="-X main.version=${version} -X main.date=${SKA_BUILD_DATE} -X main.commit=${SKA_GIT_COMMIT_ID} -X main.branch=${SKA_GIT_BRANCH}" -o "build/skating${Ext}" ./cmd/skating
             echo "::set-var output=build/skating${Ext}"
+        - name: compile-linux-arm64
+          type: shell
+          env:
+            default: 
+              GOARCH: "arm64"
+              GOOS: "linux"
+              Ext: "-arm64"
+            windows: 
+              SKA_SHELL: "powershell"
+            linux: 
+              SKA_SHELL: "bash"
+          script: |
+            echo "Building with SKA_BUILD_ID=${SKA_BUILD_ID}"
+            echo "version=${version}"
+            echo "Ext=${Ext}"
+            echo "GOOS=${GOOS}"
+            echo "GOARCH=${GOARCH}"
+            echo "SKA_GIT_COMMIT_ID=${SKA_GIT_COMMIT_ID}"
+            echo "SKA_GIT_BRANCH=${SKA_GIT_BRANCH}"
+            go build -ldflags="-X main.version=${version} -X main.date=${SKA_BUILD_DATE} -X main.commit=${SKA_GIT_COMMIT_ID} -X main.branch=${SKA_GIT_BRANCH}" -o "build/skating${Ext}" ./cmd/skating
+            echo "::set-var arm_output=build/skating${Ext}"
         - name: finish
           type: shell
           when: SKA_OS == windows
@@ -72,10 +105,16 @@ pipeline:
             cp "${win_output}" "./skating${Ext}"
             cp "${win_output}" "D:/green/bin/skating${Ext}"
     - name: test
+      description: "运行测试"
       parallel: false
       steps:
         - name: test
           type: shell
           script: |
             echo "Testing with SKA_BUILD_ID=${SKA_BUILD_ID}"
- 
+    - name: deploy
+      description: "部署到远端服务器"
+      parallel: false
+      when: false
+
+          

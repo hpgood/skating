@@ -73,10 +73,14 @@ skating run           # Run the build (project name is optional — defaults to 
 |---------|-------------|
 | `skating init` | Initialize a project with `.skating.yaml` and `scripts/` |
 | `skating run <project>` | Execute the pipeline build (project name optional — defaults to current directory) |
+| `skating groups [project]` | List the groups in `pipeline.groups` with their stages and descriptions (name optional — defaults to current directory) |
+| `skating stages [project]` | List the stages in declaration order with their descriptions (name optional — defaults to current directory) |
 | `skating update` | Sync name/image from the current `.skating.yaml` to the project registry |
 | `skating config [project]` | View project configuration (name optional — defaults to current directory) |
 | `skating logs [project]` | View build logs (`--last N`, `--id N`; name optional — defaults to current directory) |
 | `skating clean [project]` | Clear build logs (keeps BuildID and registry; name optional — defaults to current directory) |
+| `skating stats` | Show running tasks and live progress; `--once`, `--all`, `--prune` |
+| `skating stop [project] <id>` | Stop a running build, or delete a stale (zombie) record |
 | `skating version` | Print version (commit, build date) |
 | `skating skill` | Output SKILL guide for AI agents |
 | `skating ls` | List all registered projects and their status |
@@ -96,6 +100,29 @@ skating run [project-name[+group]] [flags]
 | `--step`, `-s`  | `<stage>` or `<stage>/<step>` | Run only the named stage (or single step). Other stages / same-stage siblings are reported as `skipped` in the summary but never execute. |
 | `--group`, `-g` | `<name>` | Run only the stages in the named group (defined under `pipeline.groups` in `.skating.yaml`). Mutually exclusive with `--step`. |
 | `--env`, `-e`   | `KEY=VAL` (repeatable) | Inject a custom environment variable into every step of this run. User values **override** the built-in `SKA_BUILD_*` variables. |
+| `--timeout` | `10m` / `600s` / `600` | Override the run timeout for this invocation (Go duration, or plain seconds). Takes precedence over the `timeout` field in `.skating.yaml`. |
+
+#### Run timeout (`--timeout`)
+
+The whole pipeline has a run timeout; it defaults to **10m** and can be set in
+`.skating.yaml`:
+
+```yaml
+name: myproj
+timeout: 10m        # Go duration ("10m"/"600s") or plain seconds ("600")
+pipeline:
+  # ...
+```
+
+`--timeout` overrides that value for a single run (accepts the same formats):
+
+```bash
+skating run myproj --timeout 5m
+skating run myproj --timeout 600
+```
+
+When the timeout is exceeded, running subprocesses are terminated and the build is
+reported as `timeout`.
 
 #### Selective execution with `--step`
 
@@ -129,8 +156,10 @@ Define named stage sets under `pipeline.groups` and run one with `--group <name>
 name: myproj
 pipeline:
   groups:
-    all:        [init, build, test]
-    only_build: [build]
+    all:
+      stages: [init, build, test]
+      description: "Full pipeline: init, build, test"
+    only_build: [build]     # list shorthand; description is empty
     test:       [test]
   stages:
     - name: init
@@ -140,6 +169,11 @@ pipeline:
     - name: test
       # ...
 ```
+
+Both forms may be mixed under the same `groups:`. A plain list is equivalent to
+`{stages: [...]}` with an empty description; the mapping form requires `stages`
+and accepts an optional single-line `description` that is display-only (it does
+not affect execution).
 
 ```bash
 # Run every stage in the 'all' group
@@ -162,6 +196,17 @@ $ skating run myproj --group nope
 ERROR: group "nope" not found. Known groups: [all only_build test]
 ```
 
+List the groups and their descriptions (project name optional — defaults to the
+current directory, which does not need to be registered):
+
+```bash
+$ skating groups myproj
+GROUP       STAGES            DESCRIPTION
+all         init, build, test Full pipeline: init, build, test
+only_build  build             -
+test        test              -
+```
+
 Behavior notes:
 - A group is a *set* of stage names: execution order always follows the declaration
   order in `pipeline.stages`, not the order written inside the group.
@@ -170,6 +215,8 @@ Behavior notes:
 - Group entries may only be stage names — for a single step use `--step <stage>/<step>`.
 - Group names and stage names live in different namespaces, so `groups.test` may
   reference the stage named `test`.
+- `description` is intended to be a single line; it is ignored by `run` and only
+  shown by `skating groups` (an empty description is displayed as `-`).
 - The positional `+<group>` form is mutually exclusive with `-g`/`--group` (specifying
   both is an error) and with `--step`. `--env` combines with either.
 - `+` (not `@`) is the separator because a leading `@` is swallowed by PowerShell
@@ -178,6 +225,24 @@ Behavior notes:
 - A project name containing `+` is not supported (it would be split as a group separator).
 - Every group is validated when the config is loaded: an unknown stage reference is
   a hard error even if that group is not the one being run.
+
+#### Listing stages
+
+List the stages declared under `pipeline.stages` together with their descriptions.
+Unlike `skating groups`, the output follows the declaration order, which is also the
+execution order:
+
+```bash
+$ skating stages myproj
+STAGE   DESCRIPTION
+init    -
+build   Compile all platform binaries
+test    Run the test suite
+```
+
+The project name is optional — without it the `.skating.yaml` in the current
+directory is used, and the project does not need to be registered. `description` is
+display-only (`run` ignores it) and an empty description is shown as `-`.
 
 #### Custom env vars with `--env`
 
@@ -213,6 +278,48 @@ Behavior:
 - **Not registered** → registers the project (name defaults to the directory name if not set in YAML)
 - **Same name exists** → updates its `image` and `path`
 - **Same path, renamed in YAML** → renames the project record
+
+#### `skating stats`
+
+Shows in-progress tasks with live progress (refreshes every 2s; add `--once` to
+render one snapshot and exit). The `Concurrency: N/M` headline counts only tasks
+that are actually holding a slot.
+
+```bash
+skating stats --once
+skating stats --all      # also list recent finished records
+skating stats --prune    # delete stale (zombie) records
+```
+
+A record becomes **stale** when its heartbeat stops for more than 15s — which
+happens when a `skating run` process dies without finishing (e.g. `kill -9`, OOM
+killer, power loss, killed container). Stale records:
+
+- do **not** consume a concurrency slot, so they never block new builds;
+- keep showing in the list until pruned, and are auto-removed after 7 days.
+
+Use `--prune` to delete them immediately. `--prune` never touches live running or
+finished records.
+
+A build that is killed before it finishes has **no log file** and its status in
+`projects.yaml` is not updated — logs are written only when the run completes.
+
+#### `skating stop [project] <id>`
+
+Stop a running build on this host, or clean a stale (zombie) record. The project
+name is optional and defaults to the current directory.
+
+```bash
+skating stats --once          # find the PROJECT and BUILD# first
+skating stop 102              # project from the current directory
+skating stop training 102     # explicit project
+```
+
+Behavior:
+- **running**, heartbeat fresh → terminate the process (`SIGTERM` then `SIGKILL` on
+  Unix; `taskkill /T /F` on Windows) and mark the record `stopped`;
+- **stale** / process already gone → delete the zombie record;
+- **already finished** (success/failure/timeout/stopped) → nothing to do.
 
 ## Three-Layer Architecture
 
@@ -313,6 +420,58 @@ steps:
     script: |
       go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
 ```
+
+### Stage Description (`description`)
+
+A stage may carry an optional single-line `description`, displayed by `skating stages`:
+
+```yaml
+stages:
+  - name: build
+    description: "Compile all platform binaries"
+```
+
+It is display-only: it never affects execution, group validation, or environment
+variable resolution. An empty description is shown as `-`.
+
+### Stage Condition (`when`)
+
+A stage may carry an optional `when` condition, using the same syntax as the
+step-level `when`. When it evaluates to false the whole stage is skipped: every
+step inside it is reported as `skipped` with the reason `stage condition not met`,
+and the build still succeeds.
+
+```yaml
+stages:
+  - name: deploy
+    when: false                 # disable the stage entirely
+    steps:
+      - name: release
+        type: shell
+        script: ./deploy.sh
+
+  - name: publish
+    when: branch == "main"      # expression on git context / env
+    steps:
+      - name: push
+        type: shell
+        script: docker push myapp
+```
+
+- Accepted values: omitted or empty (always run), the boolean literals `true` /
+  `false` (case-insensitive), or a comparison expression using
+  `==`, `!=`, `>`, `<`, `>=`, `<=`.
+- The condition sees the build env, stage env, the cross-step variable pool, and
+  the git context (`branch`, `commit`, `git_dirty`).
+- It is evaluated before step filtering, so `--step <stage>/<step>` cannot bypass
+  `when: false`.
+- With `--group`, a skipped stage does not count as a failure: later selected
+  stages still run.
+- An invalid expression is an error: every step of the stage is reported as
+  `failed`.
+
+Step-level `when` accepts the same boolean literals, so `when: false` disables a
+single step without failing the build.
 
 ### Stage Environment (`env`)
 

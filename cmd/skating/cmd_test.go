@@ -17,6 +17,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,8 +30,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hpgood/skating/internal/runstate"
 	"github.com/hpgood/skating/internal/store"
 	"github.com/spf13/pflag"
+	bolt "go.etcd.io/bbolt"
 )
 
 func setupE2E(t *testing.T) string {
@@ -94,6 +98,10 @@ func executeCmd(t *testing.T, args ...string) (stdout, stderr string) {
 	runStep = ""
 	runGroup = ""
 	runUserEnv = nil
+	runTimeout = ""
+	statsAll = false
+	statsOnce = false
+	statsPrune = false
 	// Reset parsed-flag state so subsequent Flag().Parse() doesn't think flags
 	// are already set.
 	target.Flags().VisitAll(func(pf *pflag.Flag) { pf.Changed = false })
@@ -1106,7 +1114,9 @@ pipeline:
 const groupYAML = `name: grouptest
 pipeline:
   groups:
-    all:        [init, build, test]
+    all:
+      stages: [init, build, test]
+      description: "full pipeline"
     only_build: [build]
   stages:
     - name: init
@@ -1145,6 +1155,249 @@ func writeGroupProject(t *testing.T, home string) string {
 		t.Fatalf("write yaml: %v", err)
 	}
 	return projDir
+}
+
+// groupDescYAML 是 groups 命令测试用的配置：mapping 形式 group 带 description，
+// 列表形式 group 的 description 为空（应显示为 "-"）。
+const groupDescYAML = `name: groupdesc
+pipeline:
+  groups:
+    all:
+      stages: [init, build]
+      description: "full pipeline"
+    build: [build]
+  stages:
+    - name: init
+      steps:
+        - name: init-step
+          type: shell
+          script: |
+            echo "INIT"
+    - name: build
+      steps:
+        - name: build-step
+          type: shell
+          script: |
+            echo "BUILD"
+`
+
+// groupTableLine 返回表格输出中以 prefix 开头的行（用于按 group 名断言各列）。
+func groupTableLine(out, prefix string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
+// TestGroups_CurrentDir 验证无参数时直接读取当前目录的 .skating.yaml，
+// 输出 group 名、stage 列表、description（列表形式的 group 显示 "-"）。
+func TestGroups_CurrentDir(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "groupdesc")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+	// 不执行 init：groups 无参数时不要求项目已注册。
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(groupDescYAML), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "groups")
+	if stderr != "" {
+		t.Fatalf("groups: stderr=%q", stderr)
+	}
+
+	allLine := groupTableLine(stdout, "all")
+	if allLine == "" {
+		t.Fatalf("output should contain an 'all' row: %q", stdout)
+	}
+	if !strings.Contains(allLine, "init, build") {
+		t.Errorf("all row should list stages joined by ', ': %q", allLine)
+	}
+	if !strings.Contains(allLine, "full pipeline") {
+		t.Errorf("all row should show description: %q", allLine)
+	}
+
+	buildLine := groupTableLine(stdout, "build")
+	if buildLine == "" {
+		t.Fatalf("output should contain a 'build' row: %q", stdout)
+	}
+	if !strings.Contains(buildLine, "-") {
+		t.Errorf("list-form group should show '-' for description: %q", buildLine)
+	}
+}
+
+// TestGroups_RegisteredProject 验证带项目名参数时从已注册项目路径读取配置。
+func TestGroups_RegisteredProject(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "groups", "grouptest")
+	if stderr != "" {
+		t.Fatalf("groups grouptest: stderr=%q", stderr)
+	}
+
+	allLine := groupTableLine(stdout, "all")
+	if allLine == "" {
+		t.Fatalf("output should contain an 'all' row: %q", stdout)
+	}
+	if !strings.Contains(allLine, "init, build, test") {
+		t.Errorf("all row should list all stages: %q", allLine)
+	}
+	if !strings.Contains(allLine, "full pipeline") {
+		t.Errorf("all row should show description from mapping form: %q", allLine)
+	}
+
+	onlyBuildLine := groupTableLine(stdout, "only_build")
+	if onlyBuildLine == "" {
+		t.Fatalf("output should contain an 'only_build' row: %q", stdout)
+	}
+	if !strings.Contains(onlyBuildLine, "-") {
+		t.Errorf("list-form group should show '-' for description: %q", onlyBuildLine)
+	}
+}
+
+// TestGroups_NoGroups 验证未定义 pipeline.groups 时输出提示且不报错。
+func TestGroups_NoGroups(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "nogroups")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+	cfg := `name: nogroups
+pipeline:
+  stages:
+    - name: build
+      steps:
+        - name: build-step
+          type: shell
+          script: |
+            echo "BUILD"
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(cfg), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "groups")
+	if stderr != "" {
+		t.Fatalf("groups without pipeline.groups should not error: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "pipeline.groups") {
+		t.Errorf("output should mention missing pipeline.groups: %q", stdout)
+	}
+}
+
+// stageDescYAML 是 stages 命令测试用的配置：setup/verify 带 description，
+// compile 不带（应显示为 "-"），且声明顺序与字母序不同以验证按声明顺序输出。
+const stageDescYAML = `name: stagedesc
+pipeline:
+  stages:
+    - name: setup
+      description: "Initialize the workspace"
+      steps:
+        - name: setup-step
+          type: shell
+          script: |
+            echo "SETUP"
+    - name: compile
+      steps:
+        - name: compile-step
+          type: shell
+          script: |
+            echo "COMPILE"
+    - name: verify
+      description: "Run the test suite"
+      steps:
+        - name: verify-step
+          type: shell
+          script: |
+            echo "VERIFY"
+`
+
+// TestStages_CurrentDir 验证无参数时直接读取当前目录的 .skating.yaml，
+// 按声明顺序输出 stage 及其 description（空 description 显示 "-"）。
+func TestStages_CurrentDir(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "stagedesc")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+	// 不执行 init：stages 无参数时不要求项目已注册。
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(stageDescYAML), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "stages")
+	if stderr != "" {
+		t.Fatalf("stages: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "STAGE") || !strings.Contains(stdout, "DESCRIPTION") {
+		t.Fatalf("output should contain STAGE / DESCRIPTION header: %q", stdout)
+	}
+
+	setupLine := groupTableLine(stdout, "setup")
+	if setupLine == "" {
+		t.Fatalf("output should contain a 'setup' row: %q", stdout)
+	}
+	if !strings.Contains(setupLine, "Initialize the workspace") {
+		t.Errorf("setup row should show description: %q", setupLine)
+	}
+
+	compileLine := groupTableLine(stdout, "compile")
+	if compileLine == "" {
+		t.Fatalf("output should contain a 'compile' row: %q", stdout)
+	}
+	if !strings.Contains(compileLine, "-") {
+		t.Errorf("stage without description should show '-': %q", compileLine)
+	}
+
+	verifyLine := groupTableLine(stdout, "verify")
+	if verifyLine == "" {
+		t.Fatalf("output should contain a 'verify' row: %q", stdout)
+	}
+	if !strings.Contains(verifyLine, "Run the test suite") {
+		t.Errorf("verify row should show description: %q", verifyLine)
+	}
+
+	// 声明顺序：setup -> compile -> verify（字母序应为 compile < setup < verify）
+	idxSetup := strings.Index(stdout, "setup")
+	idxCompile := strings.Index(stdout, "compile")
+	idxVerify := strings.Index(stdout, "verify")
+	if idxSetup < 0 || idxCompile < 0 || idxVerify < 0 || !(idxSetup < idxCompile && idxCompile < idxVerify) {
+		t.Errorf("stages should follow declaration order setup/compile/verify: %q", stdout)
+	}
+}
+
+// TestStages_RegisteredProject 验证带项目名参数时从已注册项目路径读取配置
+// （当前目录已切到项目目录之外）。
+func TestStages_RegisteredProject(t *testing.T) {
+	home := setupE2E(t)
+	projDir := writeGroupProject(t, home)
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(stageDescYAML), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	chdir(t, t.TempDir())
+
+	stdout, stderr := executeCmd(t, "stages", "grouptest")
+	if stderr != "" {
+		t.Fatalf("stages grouptest: stderr=%q", stderr)
+	}
+
+	setupLine := groupTableLine(stdout, "setup")
+	if setupLine == "" {
+		t.Fatalf("output should contain a 'setup' row: %q", stdout)
+	}
+	if !strings.Contains(setupLine, "Initialize the workspace") {
+		t.Errorf("setup row should show description from registered project: %q", setupLine)
+	}
+	if compileLine := groupTableLine(stdout, "compile"); !strings.Contains(compileLine, "-") {
+		t.Errorf("stage without description should show '-': %q", compileLine)
+	}
 }
 
 // TestRun_GroupAll 验证 --group all 会运行组内全部 stage。
@@ -1423,5 +1676,205 @@ pipeline:
 	combined := stdout + stderr
 	if !strings.Contains(combined, "VERSION=0.2.1") {
 		t.Errorf("stage env ${SKA_BUILD_ID} not interpolated (want VERSION=0.2.1): %q", combined)
+	}
+}
+
+// TestRun_StageWhenFalseSkipsStage 验证 stage 级 when: false 时该 stage 的 step
+// 在摘要中记为 skipped，且整体构建仍为 success。
+func TestRun_StageWhenFalseSkipsStage(t *testing.T) {
+	home := setupE2E(t)
+	projDir := filepath.Join(home, "stagewhen")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	chdir(t, projDir)
+
+	if _, stderr := executeCmd(t, "init"); stderr != "" {
+		t.Fatalf("init: %q", stderr)
+	}
+
+	yamlContent := `name: stagewhen
+pipeline:
+  groups:
+    all: [build, deploy]
+  stages:
+    - name: build
+      steps:
+        - name: build-step
+          type: shell
+          script: |
+            echo "BUILD"
+    - name: deploy
+      when: false
+      steps:
+        - name: deploy-step
+          type: shell
+          script: |
+            echo "DEPLOY"
+`
+	if err := os.WriteFile(filepath.Join(projDir, ".skating.yaml"), []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	stdout, stderr := executeCmd(t, "run", "stagewhen", "--group", "all")
+	if stderr != "" {
+		t.Fatalf("run stagewhen: stderr=%q", stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "[build/build-step] success") {
+		t.Errorf("build stage should have run: %q", combined)
+	}
+	if !strings.Contains(combined, "[deploy/deploy-step] skipped") {
+		t.Errorf("disabled stage step should be skipped: %q", combined)
+	}
+	if strings.Contains(combined, "DEPLOY") {
+		t.Errorf("disabled stage should not execute its script: %q", combined)
+	}
+	if !strings.Contains(combined, "=== Build SUCCESS ===") && !strings.Contains(combined, "=== 构建完成: success ===") {
+		t.Errorf("build should still succeed with a disabled stage: %q", combined)
+	}
+}
+
+// TestRun_TimeoutFlagOverride 验证 --timeout 覆盖运行超时并在启动时打印覆盖后的值。
+func TestRun_TimeoutFlagOverride(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest", "--timeout", "5m")
+	if stderr != "" {
+		t.Fatalf("run --timeout 5m: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "Timeout: 5m0s") {
+		t.Errorf("expected overridden timeout 'Timeout: 5m0s' in stdout: %q", stdout)
+	}
+}
+
+// TestRun_TimeoutFlagInvalid 验证非法 --timeout 报错，且不执行 pipeline。
+func TestRun_TimeoutFlagInvalid(t *testing.T) {
+	home := setupE2E(t)
+	writeGroupProject(t, home)
+
+	stdout, stderr := executeCmd(t, "run", "grouptest", "--timeout", "nope")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for invalid --timeout, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "--timeout") {
+		t.Errorf("error should mention --timeout: %q", stderr)
+	}
+	// 未进入 pipeline：不应出现 step 执行/skip 标记
+	if strings.Contains(stdout+stderr, "[build/build-step]") {
+		t.Errorf("pipeline should not run on invalid --timeout: %q", stdout+stderr)
+	}
+}
+
+// TestStats_PruneOnce 验证 stats --once --prune 能正常运行并在无残留时报告清理 0 条。
+func TestStats_PruneOnce(t *testing.T) {
+	_ = setupE2E(t)
+
+	stdout, stderr := executeCmd(t, "stats", "--once", "--prune")
+	if stderr != "" {
+		t.Fatalf("stats --once --prune: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "Pruned 0") {
+		t.Errorf("expected 'Pruned 0' in stdout: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Concurrency: 0/") {
+		t.Errorf("expected 'Concurrency: 0/' headline: %q", stdout)
+	}
+}
+
+// seedRunRecord 直接向本机 runstate.db 写入一条记录（供 stop 测试构造僵尸任务）。
+func seedRunRecord(t *testing.T, home, project string, buildID int, status string, lastUpdate time.Time) {
+	t.Helper()
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	id := fmt.Sprintf("%s/%s/%d", host, project, buildID)
+	st := runstate.State{
+		ID: id, Host: host, PID: 999999, Project: project, BuildID: buildID,
+		Status: status, StartTime: lastUpdate, LastUpdate: lastUpdate,
+	}
+	buf, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	dbPath := filepath.Join(home, ".skating", "runstate.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open runstate db: %v", err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("runs"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(id), buf)
+	}); err != nil {
+		t.Fatalf("put state: %v", err)
+	}
+}
+
+// TestStop_RemovesStaleRecord 验证 stop 对心跳超时的僵尸记录直接删除。
+func TestStop_RemovesStaleRecord(t *testing.T) {
+	home := setupE2E(t)
+	seedRunRecord(t, home, "grouptest", 102, runstate.StatusRunning, time.Now().Add(-time.Hour))
+
+	stdout, stderr := executeCmd(t, "stop", "grouptest", "102")
+	if stderr != "" {
+		t.Fatalf("stop: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "Removed stale record") {
+		t.Errorf("expected stale-record removal message, got: %q", stdout)
+	}
+	if _, err := runstate.LocalState("grouptest", 102); !errors.Is(err, runstate.ErrNotFound) {
+		t.Errorf("stale record should be deleted, got err=%v", err)
+	}
+}
+
+// TestStop_UnknownBuild 验证 stop 对不存在的记录报错。
+func TestStop_UnknownBuild(t *testing.T) {
+	_ = setupE2E(t)
+
+	_, stderr := executeCmd(t, "stop", "grouptest", "999")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for unknown build, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "999") {
+		t.Errorf("error should mention build id 999: %q", stderr)
+	}
+}
+
+// TestStop_InvalidBuildID 验证非整数 build-id 报错。
+func TestStop_InvalidBuildID(t *testing.T) {
+	_ = setupE2E(t)
+
+	_, stderr := executeCmd(t, "stop", "grouptest", "abc")
+	if !strings.Contains(stderr, "EXEC ERROR") {
+		t.Fatalf("expected EXEC ERROR for invalid build id, got stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "abc") {
+		t.Errorf("error should mention the invalid value 'abc': %q", stderr)
+	}
+}
+
+// TestStop_AlreadyFinished 验证已结束的记录不会被误删。
+func TestStop_AlreadyFinished(t *testing.T) {
+	home := setupE2E(t)
+	seedRunRecord(t, home, "grouptest", 50, runstate.StatusSuccess, time.Now().Add(-time.Hour))
+
+	stdout, stderr := executeCmd(t, "stop", "grouptest", "50")
+	if stderr != "" {
+		t.Fatalf("stop: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "already finished") {
+		t.Errorf("expected 'already finished' message, got: %q", stdout)
+	}
+	if _, err := runstate.LocalState("grouptest", 50); err != nil {
+		t.Errorf("finished record should be kept, got err=%v", err)
 	}
 }

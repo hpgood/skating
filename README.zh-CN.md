@@ -71,10 +71,14 @@ skating run           # 执行构建（项目名可选 —— 默认当前目录
 |------|------|
 | `skating init` | 当前目录初始化项目，生成 `.skating.yaml`、`scripts/` |
 | `skating run <项目>` | 按 Pipeline 编排执行构建（项目名可选 —— 默认当前目录） |
+| `skating groups [项目]` | 列出 `pipeline.groups` 中的 group、stage 及说明（项目名可选 —— 默认当前目录） |
+| `skating stages [项目]` | 按声明顺序列出 stage 及说明（项目名可选 —— 默认当前目录） |
 | `skating update` | 将当前目录 `.skating.yaml` 的 name/image 同步到全局项目注册 |
 | `skating config [项目]` | 查看项目配置（项目名可选 —— 默认当前目录） |
 | `skating logs [项目]` | 查看构建日志（支持 `--last N`、`--id N`；项目名可选 —— 默认当前目录） |
 | `skating clean [项目]` | 清空构建日志（保留 BuildID 和项目注册信息；项目名可选 —— 默认当前目录） |
+| `skating stats` | 查看正在运行的任务及实时进度；支持 `--once`、`--all`、`--prune` |
+| `skating stop [项目] <id>` | 停止正在运行的构建，或删除 stale（僵尸）记录 |
 | `skating version` | 输出版本号（含 commit 和构建日期） |
 | `skating skill` | 输出 SKILL 指南（供 AI 智能体使用） |
 | `skating ls` | 列出所有已注册项目及构建状态 |
@@ -94,6 +98,27 @@ skating run [项目名[+group]] [flags]
 | `--step`、`-s` | `<stage>` 或 `<stage>/<step>` | 只跑指定 stage（或单个 step）。其他 stage 和同 stage 内其他 step 在 summary 里以 `skipped` 显示，但不会执行。 |
 | `--group`、`-g` | `<name>` | 只跑指定 group 内的 stage（在 `.skating.yaml` 的 `pipeline.groups` 中定义）。与 `--step` 互斥。 |
 | `--env`、`-e`  | `KEY=VAL`（可重复） | 注入自定义环境变量到本次运行的每个 step。用户传入值**优先级高于**内置 `SKA_BUILD_*` 变量。 |
+| `--timeout` | `10m` / `600s` / `600` | 覆盖本次运行的超时时间（Go duration 或纯秒数）。优先级高于 `.skating.yaml` 的 `timeout` 字段。 |
+
+#### 运行超时（`--timeout`）
+
+整个流水线有一个运行超时，默认 **10m**，可在 `.skating.yaml` 中设置：
+
+```yaml
+name: myproj
+timeout: 10m        # Go duration（"10m"/"600s"）或纯秒数（"600"）
+pipeline:
+  # ...
+```
+
+`--timeout` 可覆盖单次运行的值（格式相同）：
+
+```bash
+skating run myproj --timeout 5m
+skating run myproj --timeout 600
+```
+
+超过超时时间后，正在运行的子进程会被终止，构建状态记为 `timeout`。
 
 #### 用 `--step` 选择性执行
 
@@ -127,8 +152,10 @@ ERROR: --step "nonexistent" 中 stage "nonexistent" 不存在。已知 stage: [b
 name: myproj
 pipeline:
   groups:
-    all:        [init, build, test]
-    only_build: [build]
+    all:
+      stages: [init, build, test]
+      description: "完整流水线：初始化、构建、测试"
+    only_build: [build]     # 列表简写；description 为空
     test:       [test]
   stages:
     - name: init
@@ -138,6 +165,10 @@ pipeline:
     - name: test
       # ...
 ```
+
+两种写法可在同一个 `groups:` 下混用。纯列表等价于 `{stages: [...]}`
+（description 为空）；mapping 形式必须写 `stages`，可选单行 `description`，
+仅用于展示，不影响执行逻辑。
 
 ```bash
 # 运行 'all' 组内的全部 stage
@@ -160,16 +191,44 @@ $ skating run myproj --group nope
 ERROR: --group "nope" 不存在。已知 group: [all only_build test]
 ```
 
+列出 group 及其说明（项目名可选 —— 默认当前目录，且不要求项目已注册）：
+
+```bash
+$ skating groups myproj
+GROUP       STAGES            DESCRIPTION
+all         init, build, test 完整流水线：初始化、构建、测试
+only_build  build             -
+test        test              -
+```
+
 行为说明：
 - 组是一组 stage 的*集合*：执行顺序始终按 `pipeline.stages` 的声明顺序，而非组内书写顺序。
 - 遇首个失败 stage 即停止；其后（选中的）剩余 stage 均记为 `skipped`，整体构建仍失败。
 - 组内条目只能是 stage 名 —— 单个 step 请用 `--step <stage>/<step>`。
 - 组名与 stage 名处于不同命名空间，因此 `groups.test` 可指向名为 `test` 的 stage。
+- `description` 按单行使用；`run` 忽略该字段，只有 `skating groups` 会展示
+  （空 description 显示为 `-`）。
 - 位置 `+<group>` 与 `-g`/`--group` 互斥（同时出现报错），也与 `--step` 互斥；`--env` 可与任一组合。
 - 用 `+` 而非 `@` 作分隔符：行首 `@` 在 PowerShell 下被当作未定义变量的 splat 而静默丢弃，
   会退化成跑全量流水线。`+group` 在 bash/zsh/cmd/PowerShell 下都无需引号。
 - 项目名本身含 `+` 暂不支持（会被当作 group 分隔符切分）。
 - 加载配置时校验**所有**组：即使某个组本次未被使用，引用未知 stage 也会在运行前硬报错。
+
+#### 列出 stage
+
+列出 `pipeline.stages` 中声明的 stage 及其说明。与 `skating groups` 不同，
+输出遵循声明顺序（也就是执行顺序）：
+
+```bash
+$ skating stages myproj
+STAGE   DESCRIPTION
+init    -
+build   编译各平台二进制
+test    运行测试
+```
+
+项目名可选 —— 不传时读取当前目录的 `.skating.yaml`，且不要求项目已注册。
+`description` 仅用于展示（`run` 会忽略），空 description 显示为 `-`。
 
 #### 用 `--env` 注入自定义环境变量
 
@@ -205,6 +264,44 @@ skating update
 - **未注册** → 注册新项目（YAML 未设置 name 时用目录名）
 - **同名项目已存在** → 更新其 `image` 和 `path`
 - **同路径但 YAML 里改了名** → 重命名项目记录
+
+#### `skating stats`
+
+显示正在运行的任务及实时进度（每 2s 刷新；加 `--once` 只输出一次后退出）。
+`Concurrency: N/M` 只统计真正占用槽位的任务。
+
+```bash
+skating stats --once
+skating stats --all      # 附带最近的历史终态记录
+skating stats --prune    # 清理 stale（僵尸）记录
+```
+
+当任务的进程未正常结束（如 `kill -9`、OOM、断电、容器被杀）时心跳停止，
+超过 15s 后该记录变为 **stale**（僵尸）。stale 记录：
+
+- **不占用并发槽位**，因此不会阻塞新构建；
+- 会一直显示在列表中，直到被清理，或 7 天后自动删除。
+
+用 `--prune` 立即删除它们；`--prune` 不会影响正在运行或已结束的记录。
+
+被中途杀掉的构建**没有日志文件**，`projects.yaml` 里的状态也不会更新 —— 日志只在
+运行结束时写入。
+
+#### `skating stop [项目] <id>`
+
+停止本机正在运行的构建，或清理 stale（僵尸）记录。项目名可选，默认取当前目录。
+
+```bash
+skating stats --once          # 先确认 PROJECT 与 BUILD#
+skating stop 102              # 项目取当前目录
+skating stop training 102     # 显式指定项目
+```
+
+行为：
+- **running** 且心跳新鲜 → 终止进程（Unix 先 `SIGTERM` 再 `SIGKILL`；Windows 用
+  `taskkill /T /F`），记录标记为 `stopped`；
+- **stale** / 进程已退出 → 删除僵尸记录；
+- **已结束**（success/failure/timeout/stopped）→ 无需处理。
 
 ## 三层架构
 
@@ -305,6 +402,51 @@ steps:
     script: |
       go build -ldflags="-X main.version=${version}" -o "build/skating${Ext}" ./cmd/skating
 ```
+
+### Stage 说明（`description`）
+
+stage 可以带一个可选的单行 `description`，由 `skating stages` 展示：
+
+```yaml
+stages:
+  - name: build
+    description: "编译各平台二进制"
+```
+
+该字段仅用于展示，不影响执行、分组校验或环境变量解析。空 description 显示为 `-`。
+
+### Stage 条件（`when`）
+
+stage 可以带一个可选的 `when` 条件，语法与 step 级 `when` 相同。条件为假时整个
+stage 被跳过：stage 内每个 step 记为 `skipped`，原因为 `stage condition not met`，
+构建整体仍为成功。
+
+```yaml
+stages:
+  - name: deploy
+    when: false                 # 整段禁用
+    steps:
+      - name: release
+        type: shell
+        script: ./deploy.sh
+
+  - name: publish
+    when: branch == "main"      # 基于 git 上下文 / 环境变量的表达式
+    steps:
+      - name: push
+        type: shell
+        script: docker push myapp
+```
+
+- 取值：缺省或空串（始终执行）、布尔字面量 `true` / `false`（大小写不敏感），
+  或使用 `==`、`!=`、`>`、`<`、`>=`、`<=` 的比较表达式。
+- 条件可访问构建 env、stage env、跨 step 变量池以及 git 上下文
+  （`branch`、`commit`、`git_dirty`）。
+- 条件在 step 过滤之前求值，因此 `--step <stage>/<step>` 无法绕过 `when: false`。
+- 使用 `--group` 时，被跳过的 stage 不计为失败，后续被选中的 stage 仍会执行。
+- 表达式非法视为错误：stage 内每个 step 记为 `failed`。
+
+step 级 `when` 同样支持布尔字面量，`when: false` 可禁用单个 step 且不使构建失败。
 
 ### Stage 级环境变量（`env`）
 

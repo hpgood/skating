@@ -86,7 +86,12 @@ func (s Step) ResolveEnv(goos string) map[string]string {
 
 // Stage 表示 pipeline 中的一个阶段
 type Stage struct {
-	Name     string `yaml:"name"`
+	Name string `yaml:"name"`
+	// Description 仅用于展示（skating stages），不参与执行、分组校验或环境变量
+	Description string `yaml:"description"`
+	// When 是 stage 级条件，与 step 的 when 同语法；false 时跳过整个 stage。
+	// 支持布尔字面量（true / false，大小写不敏感）与比较表达式。
+	When     string `yaml:"when"`
 	Steps    []Step `yaml:"steps"`
 	Parallel bool   `yaml:"parallel"`
 	// Env stage 级环境变量（按平台分组，与 step env 同构）：
@@ -123,13 +128,38 @@ type Config struct {
 	Pipeline PipelineConfig `yaml:"pipeline"`
 }
 
+// Group 是 pipeline.groups 中的一个命名 stage 集合。
+// 支持两种 yaml 写法：
+//
+//	all: [init, build]                                  # 列表简写，description 为空
+//	all: {stages: [init, build], description: "全部"}   # mapping 形式
+type Group struct {
+	Stages      []string `yaml:"stages"`
+	Description string   `yaml:"description"`
+}
+
+// UnmarshalYAML 同时接受列表简写与 {stages, description} mapping 形式。
+func (g *Group) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.SequenceNode {
+		return node.Decode(&g.Stages)
+	}
+	type plain Group
+	var p plain
+	if err := node.Decode(&p); err != nil {
+		return err
+	}
+	*g = Group(p)
+	return nil
+}
+
 // PipelineConfig 嵌入到项目配置中的 pipeline 定义
 type PipelineConfig struct {
-	// Groups 定义命名 stage 集合（name -> [stage...]），供 `run --group <name>`
+	// Groups 定义命名 stage 集合（name -> Group），供 `run --group <name>`
 	// 选择性地运行一组 stage。组名与 stage 名处于不同命名空间。
+	// 每个 group 可写成 stage 列表简写，或 {stages, description} mapping 形式。
 	// 执行顺序始终按 Stages 的声明顺序，组内书写顺序无影响。
-	Groups map[string][]string `yaml:"groups"`
-	Stages []Stage             `yaml:"stages"`
+	Groups map[string]Group `yaml:"groups"`
+	Stages []Stage          `yaml:"stages"`
 }
 
 // DefaultTimeout 未配置 timeout 字段时的默认运行超时
@@ -142,15 +172,9 @@ type Duration time.Duration
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	var s string
 	if err := node.Decode(&s); err == nil {
-		s = strings.TrimSpace(s)
-		// yaml.v3 会把裸数字 decode 成字符串，纯数字按秒解释
-		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			*d = Duration(time.Duration(n) * time.Second)
-			return nil
-		}
-		dur, err := time.ParseDuration(s)
+		dur, err := ParseDuration(s)
 		if err != nil {
-			return fmt.Errorf("invalid duration %q: %w", s, err)
+			return err
 		}
 		*d = Duration(dur)
 		return nil
@@ -162,6 +186,24 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 		return nil
 	}
 	return fmt.Errorf("invalid duration value at line %d: %s", node.Line, node.Value)
+}
+
+// ParseDuration 解析时长：Go duration 字符串（"10m"/"600s"）或纯数字（按秒）。
+// yaml 的 timeout 字段与 run --timeout 共用同一解析规则。
+func ParseDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	// 纯数字按秒解释（yaml.v3 也会把裸数字 decode 成字符串）
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Duration(n) * time.Second, nil
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	return dur, nil
 }
 
 // Or 返回 d；d 非正数时返回 def
@@ -198,7 +240,7 @@ func LoadConfig(configPath string) (*Config, error) {
 // validateGroups 校验 pipeline.groups 的每一项：每个组非空，且组内每个条目
 // 都必须是已声明的 stage 名。组内重复条目按集合语义静默去重。
 // 组名排序遍历，保证错误信息确定性；已知 stage 列表按声明顺序输出。
-func validateGroups(groups map[string][]string, stages []Stage) error {
+func validateGroups(groups map[string]Group, stages []Stage) error {
 	if len(groups) == 0 {
 		return nil
 	}
@@ -211,7 +253,7 @@ func validateGroups(groups map[string][]string, stages []Stage) error {
 	}
 
 	for _, g := range slices.Sorted(maps.Keys(groups)) {
-		refs := groups[g]
+		refs := groups[g].Stages
 		if len(refs) == 0 {
 			return fmt.Errorf("pipeline.groups[%q] is empty", g)
 		}

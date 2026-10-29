@@ -23,6 +23,58 @@ func TestEvalWhen_NoOperator(t *testing.T) {
 	}
 }
 
+func TestEvalWhen_BoolLiterals(t *testing.T) {
+	tests := []struct {
+		expr string
+		want bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"TRUE", true},
+		{"False", false},
+		{"  false  ", false},
+		{"True", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.expr, func(t *testing.T) {
+			ok, err := EvalWhen(tc.expr, nil, nil)
+			if err != nil {
+				t.Fatalf("bool literal %q should not error: %v", tc.expr, err)
+			}
+			if ok != tc.want {
+				t.Errorf("%q = %v, want %v", tc.expr, ok, tc.want)
+			}
+		})
+	}
+
+	// 非布尔字面量仍需操作符
+	if _, err := EvalWhen("foo bar", nil, nil); err == nil {
+		t.Error("expected error for non-boolean literal without operator")
+	}
+}
+
+func TestEvalWhenWithEnv_BoolLiteralSkipsGit(t *testing.T) {
+	// 布尔字面量走 fast path，env 为 nil 也不会 panic
+	ok, err := evalWhenWithEnv("false", nil)
+	if err != nil || ok {
+		t.Fatalf("evalWhenWithEnv(false) = %v, %v; want false, nil", ok, err)
+	}
+	ok, err = evalWhenWithEnv("", nil)
+	if err != nil || !ok {
+		t.Fatalf("evalWhenWithEnv(\"\") = %v, %v; want true, nil", ok, err)
+	}
+}
+
+func TestEvalWhenWithEnv_DoesNotMutateEnv(t *testing.T) {
+	env := map[string]string{"SKA_BUILD_ID": "1"}
+	if _, err := evalWhenWithEnv("SKA_BUILD_ID == 1", env); err != nil {
+		t.Fatalf("evalWhenWithEnv: %v", err)
+	}
+	if len(env) != 1 {
+		t.Errorf("evalWhenWithEnv mutated shared env: %v", env)
+	}
+}
+
 func TestEvalWhen_NumericComparison(t *testing.T) {
 	tests := []struct {
 		expr string

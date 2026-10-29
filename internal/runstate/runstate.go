@@ -30,7 +30,12 @@ const (
 	StatusTimeout = "timeout"
 	// StatusStale running 记录心跳超时后的展示态（进程可能已崩溃）
 	StatusStale = "stale"
+	// StatusStopped 由 `skating stop` 主动终止；终态之一
+	StatusStopped = "stopped"
 )
+
+// ErrNotFound 指定记录不存在
+var ErrNotFound = errors.New("run record not found")
 
 const (
 	// HeartbeatInterval 心跳刷新间隔
@@ -136,12 +141,18 @@ type Tracker struct {
 	hbStopped bool
 }
 
-// Open 创建任务追踪器（不写库）。调用 Acquire 后记录才真正落库。
-func Open(project string, buildID int) (*Tracker, error) {
+// localHost 返回本机主机名（并发闸门与记录 id 的主机前缀）。取不到时用 "unknown"。
+func localHost() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
-		host = "unknown"
+		return "unknown"
 	}
+	return host
+}
+
+// Open 创建任务追踪器（不写库）。调用 Acquire 后记录才真正落库。
+func Open(project string, buildID int) (*Tracker, error) {
+	host := localHost()
 	t := &Tracker{
 		id:   fmt.Sprintf("%s/%s/%d", host, project, buildID),
 		host: host,
@@ -380,6 +391,45 @@ func (t *Tracker) stopHeartbeat() {
 	}
 }
 
+// PruneStale 删除僵尸任务记录：状态已被标记为 stale，或状态为 running 且心跳
+// 超过 StaleAfter 未刷新（进程崩溃/被强杀残留）。返回删除的条数。
+// 用于 `skating stats --prune` 手动清理这些不再占槽位、但会在列表中显示的残留。
+func PruneStale() (int, error) {
+	removed := 0
+	err := withDB(func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			rb := tx.Bucket(runsBucket)
+			if rb == nil {
+				return nil
+			}
+			now := time.Now()
+			var keys []string
+			c := rb.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var s State
+				if json.Unmarshal(v, &s) != nil {
+					continue
+				}
+				if s.Status == StatusStale ||
+					(s.Status == StatusRunning && now.Sub(s.LastUpdate) > StaleAfter) {
+					keys = append(keys, string(k))
+				}
+			}
+			for _, key := range keys {
+				if err := rb.Delete([]byte(key)); err != nil {
+					return err
+				}
+				removed++
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
 // Snapshot 返回所有运行记录。running 且心跳过期（> StaleAfter）的记录
 // 在返回值中标记为 stale（只改展示值，不动库）。
 func Snapshot() ([]State, error) {
@@ -408,4 +458,89 @@ func Snapshot() ([]State, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// IsStale 判断一条记录是否为僵尸：状态已是 stale，或状态为 running 但心跳
+// 超过 StaleAfter 未刷新（进程已崩溃/被强杀）。
+func IsStale(s State) bool {
+	return s.Status == StatusStale ||
+		(s.Status == StatusRunning && time.Since(s.LastUpdate) > StaleAfter)
+}
+
+// LocalState 返回本机（当前 hostname）指定项目与构建号的运行记录，原样返回
+// （不把过期 running 折算为 stale，由调用方用 IsStale 判断）。
+// 记录不存在时返回 ErrNotFound。
+func LocalState(project string, buildID int) (*State, error) {
+	id := fmt.Sprintf("%s/%s/%d", localHost(), project, buildID)
+	var found *State
+	err := withDB(func(db *bolt.DB) error {
+		return db.View(func(tx *bolt.Tx) error {
+			rb := tx.Bucket(runsBucket)
+			if rb == nil {
+				return nil
+			}
+			raw := rb.Get([]byte(id))
+			if raw == nil {
+				return nil
+			}
+			var s State
+			if json.Unmarshal(raw, &s) != nil {
+				return nil
+			}
+			found = &s
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, ErrNotFound
+	}
+	return found, nil
+}
+
+// SetStatus 把指定 id 的记录状态改为 status（LastUpdate 置为当前时间）。
+// 记录不存在时返回 ErrNotFound。
+func SetStatus(id, status string) error {
+	return withDB(func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			rb := tx.Bucket(runsBucket)
+			if rb == nil {
+				return ErrNotFound
+			}
+			raw := rb.Get([]byte(id))
+			if raw == nil {
+				return ErrNotFound
+			}
+			var s State
+			if err := json.Unmarshal(raw, &s); err != nil {
+				return fmt.Errorf("unmarshal state: %w", err)
+			}
+			s.Status = status
+			s.LastUpdate = time.Now()
+			buf, err := json.Marshal(s)
+			if err != nil {
+				return err
+			}
+			return rb.Put([]byte(id), buf)
+		})
+	})
+}
+
+// DeleteRecord 删除指定 id 的记录（用于清理僵尸/已结束的残留）。
+// 记录不存在时返回 ErrNotFound。
+func DeleteRecord(id string) error {
+	return withDB(func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			rb := tx.Bucket(runsBucket)
+			if rb == nil {
+				return ErrNotFound
+			}
+			if raw := rb.Get([]byte(id)); raw == nil {
+				return ErrNotFound
+			}
+			return rb.Delete([]byte(id))
+		})
+	})
 }

@@ -186,6 +186,35 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 		env = base
 	}
 
+	// stage 级条件：在 stage env 合并之后、step 过滤与并行分发之前求值，
+	// 使构建 env、stage env、跨 step 变量池与 git 上下文都可见；显式
+	// --step <stage>/<step> 也无法绕过 when: false。
+	// 求值错误视为失败（每个 step 一条 failed 结果），条件不满足则整段 skipped
+	// 并返回 nil —— 跳过的 stage 不算构建失败。
+	if stage.When != "" {
+		ok, err := evalWhenWithEnv(stage.When, vars.Merged(env))
+		if err != nil {
+			var results []*PipelineResult
+			for _, step := range stage.Steps {
+				results = append(results, &PipelineResult{
+					StageName: stage.Name,
+					StepName:  step.Name,
+					Status:    "failed",
+					Error:     fmt.Sprintf("eval stage when: %v", err),
+				})
+				if logFn != nil {
+					logFn(executor.ColorFail(fmt.Sprintf("[%s/%s] condition error: %v", stage.Name, step.Name, err)))
+				}
+			}
+			return results, fmt.Errorf("stage %q when condition: %w", stage.Name, err)
+		}
+		if !ok {
+			var results []*PipelineResult
+			appendSkippedStage(&results, stage, "stage condition not met", logFn)
+			return results, nil
+		}
+	}
+
 	// step 级过滤：在原 stage 上做"投影"——只保留匹配的 step，其余记为 skipped
 	if opts.StepName != "" {
 		var projected Stage = stage

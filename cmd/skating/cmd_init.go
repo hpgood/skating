@@ -34,9 +34,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 	skatingYaml := fmt.Sprintf(`name: %q
 pipeline:
   groups:
-    all: [build]
+    all:
+      stages: [build]
+      description: "Build the project"
   stages:
     - name: build
+      description: "Build the project"
       parallel: false
       steps:
         - name: compile

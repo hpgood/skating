@@ -38,6 +38,10 @@ var (
 	// StringArray：允许重复 -e 传多个；后传入的同名变量覆盖前面的。
 	// 最终注入到 pipeline env 时优先级高于 SKA_ 系统 env（用户显式传值胜出）。
 	runUserEnv []string
+
+	// runTimeout 通过 --timeout 覆盖 .skating.yaml 的运行超时。
+	// 接受 Go duration（"10m"/"600s"）或纯数字（按秒）。空串表示不覆盖。
+	runTimeout string
 )
 
 var runCmd = &cobra.Command{
@@ -51,6 +55,7 @@ func init() {
 	runCmd.Flags().StringVarP(&runStep, "step", "s", "", i18n.T("只运行指定的 stage 或 step（格式: <stage> 或 <stage>/<step>）", "run only the named stage/step (format: <stage> or <stage>/<step>)"))
 	runCmd.Flags().StringVarP(&runGroup, "group", "g", "", i18n.T("只运行指定 group 内的 stage（在 .skating.yaml 的 pipeline.groups 中定义）", "run only the stages in the named group (defined under pipeline.groups)"))
 	runCmd.Flags().StringArrayVarP(&runUserEnv, "env", "e", nil, i18n.T("向 step 注入自定义环境变量，格式 KEY=VAL，可重复传入", "inject custom env into steps, format KEY=VAL, repeatable"))
+	runCmd.Flags().StringVar(&runTimeout, "timeout", "", i18n.T("覆盖本次运行的超时时间（格式: 10m / 600s / 600）", "override the run timeout (format: 10m / 600s / 600)"))
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
@@ -83,6 +88,21 @@ func runRun(cmd *cobra.Command, args []string) error {
 	// 避免无效命令也递增 build 号、打印构建标题。
 	if runStep != "" && groupName != "" {
 		return errors.New(i18n.T("--group 与 --step 不能同时使用", "--group and --step are mutually exclusive"))
+	}
+
+	// --timeout 覆盖 .skating.yaml 的 timeout。同样前移校验，非法值不产生副作用。
+	var cliTimeout time.Duration
+	if runTimeout != "" {
+		d, err := pipeline.ParseDuration(runTimeout)
+		if err != nil {
+			return fmt.Errorf(i18n.T(
+				"--timeout %q 无效（示例: 10m / 600s / 600）: %w",
+				"invalid --timeout %q (examples: 10m / 600s / 600): %w"), runTimeout, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf(i18n.T("--timeout 必须为正数，得到 %q", "--timeout must be positive, got %q"), runTimeout)
+		}
+		cliTimeout = d
 	}
 
 	var projName string
@@ -183,8 +203,11 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// ---- 运行超时：.skating.yaml 的 timeout 字段，缺省 10m ----
+	// ---- 运行超时：--timeout 优先，其次 .skating.yaml 的 timeout 字段，缺省 10m ----
 	timeout := cfg.Timeout.Or(pipeline.DefaultTimeout)
+	if cliTimeout > 0 {
+		timeout = cliTimeout
+	}
 
 	// ---- 并发闸门 + 运行状态记录（bbolt）----
 	gc, err := s.GetGlobalConfig()
@@ -627,8 +650,8 @@ func parseRunGroup(raw string, cfg *pipeline.Config) (*pipeline.RunOptions, erro
 			raw, known)
 	}
 
-	set := make(map[string]bool, len(refs))
-	for _, name := range refs {
+	set := make(map[string]bool, len(refs.Stages))
+	for _, name := range refs.Stages {
 		set[name] = true
 	}
 	return &pipeline.RunOptions{Stages: set}, nil

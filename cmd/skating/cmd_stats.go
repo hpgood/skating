@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	statsAll  bool // 附带历史终态记录
-	statsOnce bool // 单次输出后退出（默认持续刷新）
+	statsAll   bool // 附带历史终态记录
+	statsOnce  bool // 单次输出后退出（默认持续刷新）
+	statsPrune bool // 清理僵尸任务（stale）记录
 )
 
 var statsCmd = &cobra.Command{
@@ -30,6 +31,7 @@ var statsCmd = &cobra.Command{
 func init() {
 	statsCmd.Flags().BoolVar(&statsAll, "all", false, i18n.T("附带最近的历史终态记录", "also show recent finished records"))
 	statsCmd.Flags().BoolVar(&statsOnce, "once", false, i18n.T("只输出一次后退出（默认持续刷新，Ctrl+C 退出）", "render once and exit (default keeps refreshing until Ctrl+C)"))
+	statsCmd.Flags().BoolVar(&statsPrune, "prune", false, i18n.T("清理僵尸任务记录（心跳超时的残留，进程已退出）", "prune stale task records (heartbeat timed out, process already gone)"))
 }
 
 func runStats(cmd *cobra.Command, args []string) error {
@@ -40,6 +42,16 @@ func runStats(cmd *cobra.Command, args []string) error {
 	gc, err := s.GetGlobalConfig()
 	if err != nil {
 		return fmt.Errorf(i18n.T("读取全局配置失败: %w", "load global config failed: %w"), err)
+	}
+
+	// --prune：清理心跳超时的僵尸任务记录（进程已退出但记录残留）。
+	// 这些记录本就不占用并发槽位，但会一直显示在列表里。
+	if statsPrune {
+		n, err := runstate.PruneStale()
+		if err != nil {
+			return fmt.Errorf(i18n.T("清理僵尸任务失败: %w", "prune stale tasks failed: %w"), err)
+		}
+		fmt.Printf(i18n.T("已清理 %d 个僵尸任务记录\n", "Pruned %d stale task record(s)\n"), n)
 	}
 
 	if statsOnce {
@@ -75,12 +87,18 @@ func renderStats(maxTasks int) error {
 
 	now := time.Now()
 
+	// running 只统计真正占用槽位的任务（stale 不占槽位，但仍列出以便排查）
 	var live []runstate.State // running / stale
 	var done []runstate.State // 终态记录
+	running := 0
 	for _, st := range states {
-		if st.Status == runstate.StatusRunning || st.Status == runstate.StatusStale {
+		switch st.Status {
+		case runstate.StatusRunning:
+			running++
 			live = append(live, st)
-		} else {
+		case runstate.StatusStale:
+			live = append(live, st)
+		default:
 			done = append(done, st)
 		}
 	}
@@ -89,7 +107,7 @@ func renderStats(maxTasks int) error {
 
 	fmt.Println(executor.ColorTitle(fmt.Sprintf(i18n.T(
 		"并发占用: %d/%d\n", "Concurrency: %d/%d\n"),
-		len(live), maxTasks)))
+		running, maxTasks)))
 
 	if len(live) == 0 {
 		fmt.Println(i18n.T("当前没有正在运行的任务", "No tasks are currently running"))
@@ -175,6 +193,8 @@ func renderStats(maxTasks int) error {
 				status = executor.ColorSuccess(status)
 			case runstate.StatusFailure, runstate.StatusTimeout:
 				status = executor.ColorFail(status)
+			case runstate.StatusStopped:
+				status = executor.ColorWarn(status)
 			}
 			fmt.Fprintf(w2, "%s\t%d\t%s\t%s\t%s\n",
 				st.Project, st.BuildID, status, dur, st.LastUpdate.Format("01-02 15:04:05"))
