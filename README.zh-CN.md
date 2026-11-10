@@ -97,7 +97,7 @@ skating run [项目名[+group]] [flags]
 |---|---|---|
 | `--step`、`-s` | `<stage>` 或 `<stage>/<step>` | 只跑指定 stage（或单个 step）。其他 stage 和同 stage 内其他 step 在 summary 里以 `skipped` 显示，但不会执行。 |
 | `--group`、`-g` | `<name>` | 只跑指定 group 内的 stage（在 `.skating.yaml` 的 `pipeline.groups` 中定义）。与 `--step` 互斥。 |
-| `--env`、`-e`  | `KEY=VAL`（可重复） | 注入自定义环境变量到本次运行的每个 step。用户传入值**优先级高于**内置 `SKA_BUILD_*` 变量。 |
+| `--env`、`-e`  | `KEY=VAL`（可重复） | 注入自定义环境变量到本次运行的每个 step。用户传入值**优先级最高**：覆盖同名内置 `SKA_*`、stage env 与 step env。 |
 | `--timeout` | `10m` / `600s` / `600` | 覆盖本次运行的超时时间（Go duration 或纯秒数）。优先级高于 `.skating.yaml` 的 `timeout` 字段。 |
 
 #### 运行超时（`--timeout`）
@@ -248,6 +248,9 @@ skating run myproj --env SKA_BUILD_ID=999
 # 两个 flag 组合：只跑 release step 并指定自定义目标
 skating run myproj --step deploy/release --env DEPLOY_TARGET=canary
 ```
+
+`--env` 的环境变量优先级最高：覆盖同名内置 `SKA_*`、stage env 与 step env，
+`when` 条件与 `env` 值插值同样能看到用户值。
 
 `--env` 格式错误（缺 `=`、KEY 为空）会在任何 step 执行前明确报错。
 
@@ -450,7 +453,7 @@ step 级 `when` 同样支持布尔字面量，`when: false` 可禁用单个 step
 
 ### Stage 级环境变量（`env`）
 
-stage 也可以定义 `env`，由**该 stage 内所有 step 共享**（平台分组规则与 step env 相同）。同名变量优先级：构建 env（`SKA_*`、`--env`）< stage env < step env：
+stage 也可以定义 `env`，由**该 stage 内所有 step 共享**（平台分组规则与 step env 相同）。同名变量优先级：构建 env（`SKA_*`）< stage env < step env < `--env`（最高）：
 
 ```yaml
 stages:
@@ -580,6 +583,7 @@ steps:
 | [mixed-shell-lua](./examples/mixed-shell-lua/) | Shell + Lua 混合流水线 |
 | [parallel-stages](./examples/parallel-stages/) | 并行 Stage 执行 |
 | [conditional-build](./examples/conditional-build/) | When 条件判断 |
+| [env-vars](./examples/env-vars/) | 环境变量的来源、作用域与优先级 |
 
 ### 用 examples 试用 `--step` 和 `--env`
 

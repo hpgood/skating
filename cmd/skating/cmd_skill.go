@@ -67,7 +67,8 @@ Options:
   separator is '+' because a leading '@' is silently swallowed by PowerShell.
   Project names containing '+' are not supported.
 - --env KEY=VAL (short: -e): inject custom env into steps. Repeatable; later
-  values win; on conflict user values override skating system env (SKA_*)
+  values win; on conflict user values have the highest priority and override
+  SKA_* system vars plus same-name stage/step env
 - --timeout <dur>: override the run timeout for this invocation. Accepts a Go
   duration ("10m"/"600s") or plain seconds ("600"). Takes precedence over the
   top-level timeout field in .skating.yaml; when unset, the config value is used,
@@ -189,7 +190,7 @@ pipeline:
       parallel: false       # If true, run all steps in this stage concurrently
       env:                  # Stage-level env, shared by all steps in the stage
         default:            # (optional; same grouping rules as step env:
-          version: "0.2.${SKA_BUILD_ID}"  # ${VAR} interpolated; stage env < step env)
+          version: "0.2.${SKA_BUILD_ID}"  # ${VAR} interpolated; --env wins over all)
         windows:
           Ext: ".exe"
       steps:
@@ -282,8 +283,8 @@ pipeline:
 - steps: (required) Ordered list of Step objects
 - env: (optional) Stage-level environment variables grouped by platform, shared
   by every step in the stage (scripts and When conditions both see them).
-  Same grouping rules as step env. Priority: build env (SKA_*, --env) <
-  stage env < step env — same-name variables are overridden by the step env.
+  Same grouping rules as step env. Priority: build env (SKA_*) < stage env <
+  step env < --env (highest) — --env overrides same-name values at every level.
 
 ### Step Execution Rules
 - Stages run sequentially; a failing stage stops the entire pipeline
@@ -311,8 +312,8 @@ Two ways to write into the pool:
   stdout. The line is captured and does NOT appear in the log or step output.
 - Lua steps: call set_env(key, value) — same effect, also visible to later steps.
 
---env, step env and SKA_* system vars are unaffected; pool variables only
-override same-name keys in the per-step env view.
+--env still has the highest priority and is not overridden by pool variables;
+otherwise pool variables override same-name keys in the per-step env view.
 
 Examples:
 ` + "```yaml" + `
@@ -528,7 +529,8 @@ Examples:
   linux / windows / darwin / ...
 - SKA_SHELL: Optional, set via step env, overrides the executing shell (see Shell Executor).
 - Step env: defined per step in .skating.yaml (default + platform groups).
-- --env KEY=VAL (skating run): user-provided; overrides SKA_* system values on conflict.
+- --env KEY=VAL (skating run): user-provided; highest priority, overrides SKA_*
+  system values and same-name stage/step env on conflict.
 - User-defined via set_env() in Lua scripts (current step + later steps, see
   Cross-Step Variables).
 - env value interpolation: values in stage/step env may reference other variables
@@ -591,6 +593,7 @@ See examples/ directory for complete project templates:
 - mixed-shell-lua:  Demonstrates both shell and lua step types
 - parallel-stages:  Demonstrates parallel step execution
 - conditional-build: Demonstrates When conditions
+- env-vars:         Demonstrates env var sources, scopes, and precedence
 
 ## Quick Start for Agents
 To create a CI pipeline for a user's project:
@@ -642,7 +645,7 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
   当前目录）等价于 --group；它们与 -g/--group 以及 --step 均互斥。分隔符用
   '+' 而非 '@'（行首 '@' 会被 PowerShell 静默丢弃）。项目名本身含 '+' 不支持。
 - --env KEY=VAL（短选项 -e）：向 step 注入自定义环境变量。可重复传入，后者覆盖前者；
-  与系统 SKA_* 变量冲突时用户值优先
+  用户值优先级最高，覆盖系统 SKA_* 以及同名 stage/step env
 - --timeout <dur>：覆盖本次运行的超时时间。接受 Go duration（"10m"/"600s"）或
   纯秒数（"600"）。优先级高于 .skating.yaml 顶层的 timeout 字段；未指定时使用
   配置值，缺省 10m。超时后正在运行的子进程会被终止，构建状态记为 timeout。
@@ -839,8 +842,8 @@ pipeline:
 - steps：（必填）Step 对象的有序列表
 - env：（可选）stage 级环境变量，按平台分组，该 Stage 内所有 Steps 共享
   （脚本的 ${VAR} 与 When 条件均可见）。分组规则与 step env 相同。
-  优先级：构建 env（SKA_*、--env）< stage env < step env
-  ——同名变量以 step env 为准
+  优先级：构建 env（SKA_*）< stage env < step env < --env（最高）
+  ——同名变量最终以 --env 为准
 
 ### 执行规则
 - Stage 按顺序执行；失败的 Stage 会终止整个流水线
@@ -865,8 +868,8 @@ Step 可以通过构建级变量池向后续 Step 传递变量。池中的变量
   该行会被捕获，不会出现在日志与 step 返回输出中
 - lua 步骤：调用 set_env(键, 值)——同样写入变量池，后续 Step 可见
 
---env、step env 与 SKA_* 系统变量不受影响；池变量仅在每 Step 的 env 视图
-中覆盖同名键。
+--env 仍保持最高优先级，不会被池变量覆盖；除此之外，池变量在每 Step 的
+env 视图中覆盖同名键。
 
 示例：
 ` + "```yaml" + `
@@ -1067,7 +1070,8 @@ stage 级与 step 级 when 均支持布尔字面量：
   linux / windows / darwin 等。
 - SKA_SHELL：可选，通过 step env 设置，覆盖执行 shell（见 Shell 执行器）。
 - step env：在 .skating.yaml 中按 step 定义（default + 平台分组）。
-- --env KEY=VAL（skating run）：用户传入；与 SKA_* 系统变量冲突时用户值优先。
+- --env KEY=VAL（skating run）：用户传入；优先级最高，覆盖 SKA_* 系统变量
+  以及同名 stage/step env。
 - 通过 Lua 的 set_env() 可自定义变量（当前 step + 后续 step 生效，见跨 Step 变量）。
 - env 值拼接：stage/step env 的值可用 ${VAR} 或 $VAR 引用其他变量并与固定文本
   拼接（如 version: "0.2.${SKA_BUILD_ID}"）。引用在 step 运行前由 skating 展开，
@@ -1129,6 +1133,7 @@ var Plugin = &SlackPlugin{}
 - mixed-shell-lua：  展示 shell 和 lua 混合使用
 - parallel-stages：  展示并行 Step 执行
 - conditional-build：展示 When 条件使用
+- env-vars：        展示环境变量的来源、作用域与优先级
 
 ## AI 智能体快速开始
 为用户的工程创建 CI 流水线：

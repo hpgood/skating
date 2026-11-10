@@ -870,9 +870,10 @@ pipeline:
 // 且用户传入的 env 优先级高于 SKA_ 系统 env（用户显式覆盖）。
 //
 // 设计:
+//   - stage env 定义 USER_OVERRIDE，step env 定义 USER_FOO，均与 --env 同名
 //   - shell step 把 SKA_BUILD_ID / USER_FOO / USER_OVERRIDE 三个 env 都 echo 出来然后 exit 1
 //   - -e USER_FOO=hello -e USER_OVERRIDE=my-value -e SKA_BUILD_ID=999
-//   - 验证 USER_FOO / USER_OVERRIDE 被注入
+//   - 验证 USER_FOO / USER_OVERRIDE 被注入，且 --env 覆盖 stage/step 同名 env
 //   - 验证 SKA_BUILD_ID 被用户值 999 覆盖（而不是系统默认的 1）
 func TestRun_EnvOverride(t *testing.T) {
 	home := setupE2E(t)
@@ -890,9 +891,15 @@ func TestRun_EnvOverride(t *testing.T) {
 pipeline:
   stages:
     - name: probe
+      env:
+        default:
+          USER_OVERRIDE: from-stage
       steps:
         - name: dump-env
           type: shell
+          env:
+            default:
+              USER_FOO: from-step
           script: |
             echo "SKA_BUILD_ID=${SKA_BUILD_ID}"
             echo "USER_FOO=${USER_FOO}"

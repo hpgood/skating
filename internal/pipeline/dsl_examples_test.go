@@ -79,6 +79,7 @@ func TestExamplePipelineStages(t *testing.T) {
 		{"mixed-shell-lua", 3, 3, true, true, false, false},
 		{"parallel-stages", 3, 3, true, true, true, false},
 		{"conditional-build", 3, 5, true, true, false, true},
+		{"env-vars", 5, 14, true, true, false, true},
 	}
 
 	examplesDir := filepath.Join("..", "..", "examples")

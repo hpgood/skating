@@ -99,7 +99,7 @@ skating run [project-name[+group]] [flags]
 |---|---|---|
 | `--step`, `-s`  | `<stage>` or `<stage>/<step>` | Run only the named stage (or single step). Other stages / same-stage siblings are reported as `skipped` in the summary but never execute. |
 | `--group`, `-g` | `<name>` | Run only the stages in the named group (defined under `pipeline.groups` in `.skating.yaml`). Mutually exclusive with `--step`. |
-| `--env`, `-e`   | `KEY=VAL` (repeatable) | Inject a custom environment variable into every step of this run. User values **override** the built-in `SKA_BUILD_*` variables. |
+| `--env`, `-e`   | `KEY=VAL` (repeatable) | Inject a custom environment variable into every step of this run. User values have the **highest priority**: they override same-named built-in `SKA_*`, stage `env`, and step `env` values. |
 | `--timeout` | `10m` / `600s` / `600` | Override the run timeout for this invocation (Go duration, or plain seconds). Takes precedence over the `timeout` field in `.skating.yaml`. |
 
 #### Run timeout (`--timeout`)
@@ -262,6 +262,10 @@ skating run myproj --env SKA_BUILD_ID=999
 # Both flags together: deploy only the 'release' step with a custom target
 skating run myproj --step deploy/release --env DEPLOY_TARGET=canary
 ```
+
+`--env` has the highest environment priority: it overrides same-named built-in
+`SKA_*` variables as well as stage and step `env` values, and is also visible to
+`when` conditions and `env` value interpolation.
 
 Malformed `--env` values (missing `=`, empty KEY) produce a clear error before any step runs.
 
@@ -475,7 +479,7 @@ single step without failing the build.
 
 ### Stage Environment (`env`)
 
-A stage can also define `env`, shared by **all steps inside the stage** (same platform grouping rules as step env). Priority on same-name conflicts: build env (`SKA_*`, `--env`) < stage env < step env:
+A stage can also define `env`, shared by **all steps inside the stage** (same platform grouping rules as step env). Priority on same-name conflicts: build env (`SKA_*`) < stage env < step env < `--env` (highest):
 
 ```yaml
 stages:
@@ -613,6 +617,7 @@ See the [examples/](./examples/) directory:
 | [mixed-shell-lua](./examples/mixed-shell-lua/) | Shell + Lua hybrid pipeline |
 | [parallel-stages](./examples/parallel-stages/) | Parallel stage execution |
 | [conditional-build](./examples/conditional-build/) | When condition examples |
+| [env-vars](./examples/env-vars/) | Environment variable sources, scopes, and precedence |
 
 ### Try `--step` and `--env` with the examples
 

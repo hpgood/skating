@@ -37,6 +37,10 @@ type RunOptions struct {
 	StepName  string
 	// Stages 是 --group 选中的 stage 名集合；非空即“组模式”。
 	Stages map[string]bool
+	// UserEnv 是 --env 注入的用户变量，优先级最高：
+	// 在 stage env / step env / 跨 step 变量池之后覆盖同名变量。
+	// nil 表示没有用户注入，保持默认优先级。
+	UserEnv map[string]string
 }
 
 // SelectsStage 判断当前选项是否选中名为 name 的 stage。
@@ -175,16 +179,57 @@ func expandEnvValues(m, base map[string]string) map[string]string {
 	return out
 }
 
-func runStage(stage Stage, exec Executor, env map[string]string, logFn func(string), opts *RunOptions, vars *VarPool) ([]*PipelineResult, error) {
-	// 合并 stage 级 env（default + 当前平台组）到本 stage 的 base env：
-	// stage 内所有 step 共享，When 条件同样可见。
-	// 优先级：构建 env < stage env < step env；克隆避免污染共享构建 env。
-	if m := stage.ResolveEnv(runtime.GOOS); len(m) > 0 {
-		m = expandEnvValues(m, env)
-		base := maps.Clone(env)
-		maps.Copy(base, m)
-		env = base
+// withUserEnv 返回叠加了用户环境变量的 env 副本。userEnv 来自 --env，
+// 优先级最高：覆盖构建 env、stage/step env 以及同名跨 step 变量。
+// userEnv 为空时原样返回，不做克隆。
+func withUserEnv(env, userEnv map[string]string) map[string]string {
+	if len(userEnv) == 0 {
+		return env
 	}
+	out := maps.Clone(env)
+	if out == nil {
+		out = map[string]string{}
+	}
+	maps.Copy(out, userEnv)
+	return out
+}
+
+// mergeEnvLayer 把一层 stage/step env 合并到 base 上：
+//   - 先按 base（含 --env 覆盖）展开 layer 中的 ${VAR}；
+//   - layer 中与 --env 同名的键直接丢弃，改由 --env 提供，
+//     保证插值也看到用户值；
+//   - 合并后再用 --env 覆盖一次，确保用户值最终胜出。
+//
+// 返回新 map，不修改 base 与 layer。
+func mergeEnvLayer(base, layer, userEnv map[string]string) map[string]string {
+	base = withUserEnv(base, userEnv)
+	if len(layer) > 0 {
+		if len(userEnv) > 0 {
+			filtered := maps.Clone(layer)
+			for k := range userEnv {
+				delete(filtered, k)
+			}
+			layer = filtered
+		}
+		m := expandEnvValues(layer, base)
+		if len(m) > 0 {
+			merged := maps.Clone(base)
+			if merged == nil {
+				merged = map[string]string{}
+			}
+			maps.Copy(merged, m)
+			base = merged
+		}
+	}
+	return withUserEnv(base, userEnv)
+}
+
+func runStage(stage Stage, exec Executor, env map[string]string, logFn func(string), opts *RunOptions, vars *VarPool) ([]*PipelineResult, error) {
+	// 合并 stage 级 env（default + 当前平台组）到本 stage 的 base env，
+	// 并按 --env > stage env 的优先级覆盖同名变量。
+	// stage 内所有 step 共享，When 条件同样可见。
+	// 克隆避免污染共享构建 env。
+	env = mergeEnvLayer(env, stage.ResolveEnv(runtime.GOOS), opts.UserEnv)
 
 	// stage 级条件：在 stage env 合并之后、step 过滤与并行分发之前求值，
 	// 使构建 env、stage env、跨 step 变量池与 git 上下文都可见；显式
@@ -192,7 +237,8 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 	// 求值错误视为失败（每个 step 一条 failed 结果），条件不满足则整段 skipped
 	// 并返回 nil —— 跳过的 stage 不算构建失败。
 	if stage.When != "" {
-		ok, err := evalWhenWithEnv(stage.When, vars.Merged(env))
+		// 变量池可能覆盖 stage env，再叠加一次 --env 保证用户值在条件中优先。
+		ok, err := evalWhenWithEnv(stage.When, withUserEnv(vars.Merged(env), opts.UserEnv))
 		if err != nil {
 			var results []*PipelineResult
 			for _, step := range stage.Steps {
@@ -240,9 +286,9 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 		var err error
 		var innerResults []*PipelineResult
 		if projected.Parallel {
-			innerResults, err = runParallelInner(projected, exec, env, logFn, vars)
+			innerResults, err = runParallelInner(projected, exec, env, logFn, vars, opts.UserEnv)
 		} else {
-			innerResults, err = runSequentialInner(projected, exec, env, logFn, vars)
+			innerResults, err = runSequentialInner(projected, exec, env, logFn, vars, opts.UserEnv)
 		}
 		stageResults = append(stageResults, innerResults...)
 		return stageResults, err
@@ -252,24 +298,24 @@ func runStage(stage Stage, exec Executor, env map[string]string, logFn func(stri
 	// 让 stage 内 sequential step 失败后继续执行剩余 step，
 	// 这样 --step <stage> 能完整跑完 stage。
 	if opts.StageName != "" && !stage.Parallel {
-		innerResults, err := runSequentialContinueOnError(stage, exec, env, logFn, vars)
+		innerResults, err := runSequentialContinueOnError(stage, exec, env, logFn, vars, opts.UserEnv)
 		return innerResults, err
 	}
 
 	if stage.Parallel {
-		return runParallel(stage, exec, env, logFn, vars)
+		return runParallel(stage, exec, env, logFn, vars, opts.UserEnv)
 	}
-	return runSequential(stage, exec, env, logFn, vars)
+	return runSequential(stage, exec, env, logFn, vars, opts.UserEnv)
 }
 
-func runSequential(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
-	return runSequentialInner(stage, exec, env, logFn, vars)
+func runSequential(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool, userEnv map[string]string) ([]*PipelineResult, error) {
+	return runSequentialInner(stage, exec, env, logFn, vars, userEnv)
 }
 
-func runSequentialInner(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
+func runSequentialInner(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool, userEnv map[string]string) ([]*PipelineResult, error) {
 	var results []*PipelineResult
 	for _, step := range stage.Steps {
-		result := executeStep(stage.Name, step, exec, env, logFn, vars) // logFn 原样透传到 executeStep
+		result := executeStepWithUserEnv(stage.Name, step, exec, env, userEnv, logFn, vars) // logFn 原样透传到 executeStep
 		results = append(results, result)
 		if result.Status == "failed" {
 			return results, fmt.Errorf("step %q failed: %s", step.Name, result.Error)
@@ -281,11 +327,11 @@ func runSequentialInner(stage Stage, exec Executor, env map[string]string, logFn
 // runSequentialContinueOnError 用于 --step <stage> 模式：sequential stage 内
 // 一个 step 失败后仍继续执行剩余 step（让用户看到整个 stage 完整结果）。
 // 整体返回的 err 会保留第一个失败的 error 给上层做 status 决策。
-func runSequentialContinueOnError(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
+func runSequentialContinueOnError(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool, userEnv map[string]string) ([]*PipelineResult, error) {
 	var results []*PipelineResult
 	var firstErr error
 	for _, step := range stage.Steps {
-		result := executeStep(stage.Name, step, exec, env, logFn, vars)
+		result := executeStepWithUserEnv(stage.Name, step, exec, env, userEnv, logFn, vars)
 		results = append(results, result)
 		if result.Status == "failed" && firstErr == nil {
 			firstErr = fmt.Errorf("step %q failed: %s", step.Name, result.Error)
@@ -294,11 +340,11 @@ func runSequentialContinueOnError(stage Stage, exec Executor, env map[string]str
 	return results, firstErr
 }
 
-func runParallel(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
-	return runParallelInner(stage, exec, env, logFn, vars)
+func runParallel(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool, userEnv map[string]string) ([]*PipelineResult, error) {
+	return runParallelInner(stage, exec, env, logFn, vars, userEnv)
 }
 
-func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool) ([]*PipelineResult, error) {
+func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn func(string), vars *VarPool, userEnv map[string]string) ([]*PipelineResult, error) {
 	results := make([]*PipelineResult, len(stage.Steps))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -308,7 +354,7 @@ func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn f
 		wg.Add(1)
 		go func(idx int, step Step) {
 			defer wg.Done()
-			result := executeStep(stage.Name, step, exec, env, logFn, vars)
+			result := executeStepWithUserEnv(stage.Name, step, exec, env, userEnv, logFn, vars)
 			mu.Lock()
 			results[idx] = result
 			if result.Status == "failed" && firstErr == nil {
@@ -322,10 +368,17 @@ func runParallelInner(stage Stage, exec Executor, env map[string]string, logFn f
 	return results, firstErr
 }
 
+// executeStep 是不带 --env 用户变量的兼容入口，行为与 executeStepWithUserEnv 一致。
 func executeStep(stageName string, step Step, exec Executor, env map[string]string, logFn func(string), vars *VarPool) *PipelineResult {
+	return executeStepWithUserEnv(stageName, step, exec, env, nil, logFn, vars)
+}
+
+// executeStepWithUserEnv 执行单个 step。userEnv 来自 --env，优先级最高：
+// 在变量池与 step env 之后覆盖同名变量，When 条件同样看到用户值。
+func executeStepWithUserEnv(stageName string, step Step, exec Executor, env map[string]string, userEnv map[string]string, logFn func(string), vars *VarPool) *PipelineResult {
 	// 合并构建级共享变量（::set-var / Lua set_env 传入）到本 step 的 env 视图：
-	// 池为空时原样返回（不克隆）。后续 When 条件与脚本均可见，且不污染共享 env。
-	env = vars.Merged(env)
+	// 池为空时原样返回（不克隆）。随后叠加 --env，确保用户值优先。
+	env = withUserEnv(vars.Merged(env), userEnv)
 
 	result := &PipelineResult{
 		StageName: stageName,
@@ -361,13 +414,9 @@ func executeStep(stageName string, step Step, exec Executor, env map[string]stri
 
 	// 合并 step 级环境变量（default 全平台，windows/linux 等按当前平台注入）。
 	// 值中的 ${VAR} / $VAR 会按已累积的 env（构建 env + stage env + 变量池）展开，
-	// 支持拼接（如 "0.2.${SKA_BUILD_ID}"）。克隆避免污染共享 env。
-	stepEnv := env
-	if m := step.ResolveEnv(runtime.GOOS); len(m) > 0 {
-		m = expandEnvValues(m, env)
-		stepEnv = maps.Clone(env)
-		maps.Copy(stepEnv, m)
-	}
+	// 支持拼接（如 "0.2.${SKA_BUILD_ID}"）。与 --env 同名的键由 --env 覆盖。
+	// 克隆避免污染共享 env。
+	stepEnv := mergeEnvLayer(env, step.ResolveEnv(runtime.GOOS), userEnv)
 
 	// 填充所属 stage 名，供上层 Executor 适配器做进度上报
 	step.StageName = stageName

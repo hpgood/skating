@@ -486,6 +486,63 @@ func TestRunPipeline_StageEnvSharedBySteps(t *testing.T) {
 	}
 }
 
+// TestRunPipeline_UserEnvOverridesStageAndStepEnv 验证 --env 注入的用户变量
+// 优先级最高：覆盖 stage env、step env，并参与 env 值插值与 When 条件。
+func TestRunPipeline_UserEnvOverridesStageAndStepEnv(t *testing.T) {
+	exec := newFakeExecutor()
+	pl := &Pipeline{Stages: []Stage{{
+		Name: "build",
+		Env: map[string]map[string]string{
+			"default": {
+				"SHARED":     "from-stage",
+				"STAGE_ONLY": "stage-only",
+				"INTERP":     "${SHARED}/${STAGE_ONLY}",
+			},
+		},
+		Steps: []Step{
+			{Name: "plain", Type: "shell"},
+			{Name: "step-override", Type: "shell", Env: map[string]map[string]string{
+				"default": {"SHARED": "from-step", "STEP_ONLY": "step-only"},
+			}},
+			{Name: "cond", Type: "shell", When: `SHARED == "from-cli"`},
+		},
+	}}}
+	globalEnv := map[string]string{"SKA_BUILD_ID": "1"}
+	opts := &RunOptions{UserEnv: map[string]string{"SHARED": "from-cli"}}
+
+	results, err := RunPipeline(pl, exec, globalEnv, func(string) {}, opts, nil)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+
+	// stage env 被 --env 覆盖，未冲突的 stage 变量保留
+	if got := exec.envs["plain"]["SHARED"]; got != "from-cli" {
+		t.Errorf("plain SHARED = %q, want from-cli (--env should beat stage env)", got)
+	}
+	if got := exec.envs["plain"]["STAGE_ONLY"]; got != "stage-only" {
+		t.Errorf("plain STAGE_ONLY = %q, want stage-only", got)
+	}
+	// env 值插值也应看到最高优先级的 --env 值
+	if got := exec.envs["plain"]["INTERP"]; got != "from-cli/stage-only" {
+		t.Errorf("plain INTERP = %q, want from-cli/stage-only", got)
+	}
+	// step env 同样不能覆盖 --env，未冲突的 step 变量保留
+	if got := exec.envs["step-override"]["SHARED"]; got != "from-cli" {
+		t.Errorf("step-override SHARED = %q, want from-cli (--env should beat step env)", got)
+	}
+	if got := exec.envs["step-override"]["STEP_ONLY"]; got != "step-only" {
+		t.Errorf("step-override STEP_ONLY = %q, want step-only", got)
+	}
+	// When 条件看到 --env 覆盖后的值
+	if results[2].Status != "success" {
+		t.Errorf("cond status = %q, want success (When should see --env value)", results[2].Status)
+	}
+	// 共享构建 env 不能被污染
+	if _, leaked := globalEnv["SHARED"]; leaked {
+		t.Error("user/stage env leaked into shared global env")
+	}
+}
+
 // TestExecuteStep_EnvValueInterpolation 验证 step env 值支持 ${VAR}/$VAR 展开与拼接，
 // 引用可来自构建 env、step env 内的其他键（含引用链）。
 func TestExecuteStep_EnvValueInterpolation(t *testing.T) {

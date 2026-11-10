@@ -198,9 +198,17 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 解析 -e KEY=VAL 注入。重复传入时后者覆盖前者；冲突时 user env 覆盖 SKA_ 系统 env。
-	if err := injectUserEnv(env, runUserEnv); err != nil {
+	// 解析 -e KEY=VAL 注入。重复传入时后者覆盖前者；
+	// 冲突时 user env 覆盖 SKA_ 系统 env、stage env 与 step env（优先级最高）。
+	userEnv, err := injectUserEnv(env, runUserEnv)
+	if err != nil {
 		return err
+	}
+	if len(userEnv) > 0 {
+		if runOpts == nil {
+			runOpts = &pipeline.RunOptions{}
+		}
+		runOpts.UserEnv = userEnv
 	}
 
 	// ---- 运行超时：--timeout 优先，其次 .skating.yaml 的 timeout 字段，缺省 10m ----
@@ -657,19 +665,23 @@ func parseRunGroup(raw string, cfg *pipeline.Config) (*pipeline.RunOptions, erro
 	return &pipeline.RunOptions{Stages: set}, nil
 }
 
-// injectUserEnv 把 -e KEY=VAL 列表注入到 env map。
+// injectUserEnv 把 -e KEY=VAL 列表注入到 env map，并返回用户变量副本。
 //
 // 规则:
 //   - 每条必须是 KEY=VAL 格式（必须含一个且仅一个 '='）
 //   - KEY 不能为空
 //   - 同名重复传：后者覆盖前者
 //   - 与已有 env 冲突：用户值覆盖（语义：用户显式 > skating 系统默认）
-func injectUserEnv(env map[string]string, pairs []string) error {
+//
+// 返回的 map 会写入 RunOptions.UserEnv，由 runner 在 stage/step env 之后
+// 再覆盖一次，保证 --env 优先级最高。
+func injectUserEnv(env map[string]string, pairs []string) (map[string]string, error) {
+	user := make(map[string]string, len(pairs))
 	for _, kv := range pairs {
 		// 只切第一个 '='，允许 VAL 里含 '='
 		idx := strings.Index(kv, "=")
 		if idx <= 0 {
-			return fmt.Errorf(i18n.T(
+			return nil, fmt.Errorf(i18n.T(
 				"--env %q 格式错误（应为 KEY=VAL）",
 				"--env %q malformed (want KEY=VAL)"),
 				kv)
@@ -677,12 +689,13 @@ func injectUserEnv(env map[string]string, pairs []string) error {
 		key := kv[:idx]
 		val := kv[idx+1:]
 		if key == "" {
-			return fmt.Errorf(i18n.T(
+			return nil, fmt.Errorf(i18n.T(
 				"--env %q KEY 不能为空",
 				"--env %q has empty KEY"),
 				kv)
 		}
 		env[key] = val
+		user[key] = val
 	}
-	return nil
+	return user, nil
 }
