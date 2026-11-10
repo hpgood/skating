@@ -1,0 +1,177 @@
+# ============================================
+# Skating Example: 环境变量用法大全
+# ============================================
+# 演示不同来源、不同作用域的环境变量：
+#   1. 构建内置变量（SKA_*）
+#   2. stage 级 env：default + 平台分组 + 变量插值
+#   3. step 级 env：覆盖 stage 同名变量
+#   4. 跨 step 变量池：shell "::set-var" / Lua set_env
+#   5. when 条件读取环境变量
+#   6. 命令行 --env 注入与优先级
+#
+# 运行：
+#   skating run env-vars-example
+#   skating run env-vars-example --env CLI_ONLY=hello --env SKA_BUILD_ID=999
+#   skating run env-vars-example --env DEPLOY_TARGET=canary
+#   skating run env-vars-example --step cross-step
+# ============================================
+
+name: env-vars-example
+pipeline:
+  stages:
+    # ---- 1. 构建内置变量：每次构建自动注入 ----
+    - name: builtin-env
+      description: "SKA_* 构建内置环境变量"
+      steps:
+        - name: show-builtin-vars
+          type: shell
+          script: |
+            echo "SKA_BUILD_ID        = ${SKA_BUILD_ID}"
+            echo "SKA_BUILD_TIMESTAMP = ${SKA_BUILD_TIMESTAMP}"
+            echo "SKA_BUILD_DATE      = ${SKA_BUILD_DATE}"
+            echo "SKA_GIT_COMMIT_ID   = ${SKA_GIT_COMMIT_ID}"
+            echo "SKA_OS              = ${SKA_OS}"
+
+        - name: read-builtin-vars-lua
+          type: lua
+          script: |
+            log("SKA_BUILD_ID (Lua getenv) = " .. getenv("SKA_BUILD_ID"))
+            log("SKA_OS (Lua getenv)       = " .. getenv("SKA_OS"))
+
+    # ---- 2. stage 级 env：stage 内所有 step 共享 ----
+    - name: stage-env
+      description: "stage 级 env：default + 平台分组 + ${VAR} 插值"
+      env:
+        default:
+          APP_NAME: demo-app
+          LOG_LEVEL: info
+          # 值中可引用其他变量，由 skating 在 step 运行前展开
+          BUILD_CHANNEL: "${APP_NAME}-build-${SKA_BUILD_ID}"
+          # 未定义变量展开为空字符串
+          EMPTY_HANDLING: "prefix-${NOT_DEFINED}-suffix"
+        windows:
+          PLATFORM_LABEL: windows
+          EXT: ".exe"
+          LOG_LEVEL: debug # 平台组覆盖 default 中的同名变量
+        linux:
+          PLATFORM_LABEL: linux
+          EXT: ""
+          LOG_LEVEL: debug
+        darwin:
+          PLATFORM_LABEL: darwin
+          EXT: ""
+          LOG_LEVEL: debug
+      steps:
+        - name: show-stage-env
+          type: shell
+          script: |
+            echo "APP_NAME       = ${APP_NAME}"        # default 组
+            echo "LOG_LEVEL      = ${LOG_LEVEL}"       # 平台组覆盖 default
+            echo "PLATFORM_LABEL = ${PLATFORM_LABEL}"  # 仅当前平台组注入
+            echo "EXT            = ${EXT}"
+            echo "BUILD_CHANNEL  = ${BUILD_CHANNEL}"   # 由其他变量插值得到
+            echo "EMPTY_HANDLING = ${EMPTY_HANDLING}"  # 未定义变量为空
+
+        - name: lua-sees-stage-env
+          type: lua
+          script: |
+            log("APP_NAME  = " .. getenv("APP_NAME"))
+            log("LOG_LEVEL = " .. getenv("LOG_LEVEL"))
+
+    # ---- 3. step 级 env：优先级高于 stage env ----
+    - name: step-env
+      description: "step 级 env 覆盖 stage 同名变量，并支持组内引用"
+      env:
+        default:
+          LOG_LEVEL: info
+      steps:
+        - name: step-env-overrides
+          type: shell
+          env:
+            default:
+              # step > stage：最终 LOG_LEVEL 为 warn
+              LOG_LEVEL: warn
+              STEP_ONLY: only-this-step
+              # 同组内的 LOG_LEVEL 优先于 stage env 中的值
+              COMBINED: "${APP_NAME}/${SKA_OS}/${LOG_LEVEL}"
+            windows:
+              EXT: ".dll" # step 平台组覆盖 stage 平台组
+          script: |
+            echo "APP_NAME (来自 stage env) = ${APP_NAME}"
+            echo "LOG_LEVEL (step 覆盖)     = ${LOG_LEVEL}"
+            echo "EXT (step 平台覆盖)       = ${EXT}"
+            echo "STEP_ONLY                 = ${STEP_ONLY}"
+            echo "COMBINED                  = ${COMBINED}"
+
+        - name: when-uses-stage-env
+          type: shell
+          when: APP_NAME == "demo-app"
+          script: |
+            echo "when 条件命中：APP_NAME == demo-app"
+
+    # ---- 4. 跨 step 变量池：后续 step 的脚本与 when 都可见 ----
+    - name: cross-step
+      description: "shell ::set-var / Lua set_env 写入构建级变量池"
+      steps:
+        - name: producer-shell
+          type: shell
+          script: |
+            echo "=== 写入跨 step 变量 ==="
+            echo "::set-var VERSION=1.2.${SKA_BUILD_ID}"
+            echo "::set-var DEPLOY_ENV=staging"
+            echo "VERSION / DEPLOY_ENV 已写入变量池"
+
+        - name: consumer-lua
+          type: lua
+          script: |
+            log("从变量池读取 VERSION    = " .. getenv("VERSION"))
+            log("从变量池读取 DEPLOY_ENV = " .. getenv("DEPLOY_ENV"))
+            -- Lua set_env 同样写入变量池，供后续 step 使用
+            set_env("RELEASE_TAG", "v" .. getenv("VERSION"))
+
+        - name: consumer-shell
+          type: shell
+          script: |
+            echo "VERSION    = ${VERSION}"
+            echo "DEPLOY_ENV = ${DEPLOY_ENV}"
+            echo "RELEASE_TAG (Lua set_env) = ${RELEASE_TAG}"
+
+        - name: when-uses-cross-step-var
+          type: shell
+          when: DEPLOY_ENV == "staging"
+          script: |
+            echo "when 条件命中：DEPLOY_ENV == staging"
+
+    # ---- 5. 命令行 --env：优先级最高，覆盖 stage/step env ----
+    - name: cli-env
+      description: "--env 注入；同名时 --env 优先"
+      env:
+        default:
+          DEPLOY_TARGET: stage-default
+      steps:
+        - name: cli-only-var
+          type: shell
+          script: |
+            echo "CLI_ONLY = ${CLI_ONLY}"
+            echo "未传 --env 时为空，运行时试：--env CLI_ONLY=hello"
+
+        - name: cli-overrides-stage-env
+          type: shell
+          script: |
+            echo "DEPLOY_TARGET = ${DEPLOY_TARGET}"
+            echo "传入 --env DEPLOY_TARGET=canary 时为 canary（覆盖 stage env）"
+
+        - name: cli-overrides-step-env
+          type: shell
+          env:
+            default:
+              DEPLOY_TARGET: step-default
+          script: |
+            echo "DEPLOY_TARGET = ${DEPLOY_TARGET}"
+            echo "传入 --env DEPLOY_TARGET=canary 时为 canary（覆盖 step env）"
+
+        - name: override-builtin-var
+          type: shell
+          script: |
+            echo "SKA_BUILD_ID = ${SKA_BUILD_ID}"
+            echo "运行时试：--env SKA_BUILD_ID=999 覆盖内置构建编号"
