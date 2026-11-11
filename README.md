@@ -554,6 +554,7 @@ steps:
   - name: remote-build
     type: ssh
     host: 10.0.0.1
+    port: "${SERVER_PORT}"       # optional; default 22; ${VAR} supported
     user: deploy
     secret: deploy-pass          # password (default) or "key" auth
     workdir: /opt/app
@@ -590,10 +591,12 @@ Behavior notes:
   files that no longer exist locally. On first deploy the remote directory may
   not exist yet.
 - `local` / `remote` support `${VAR}` expansion from the step env view
-  (`SKA_*` system vars, step env, cross-step variable pool). `host`, `user`
-  and `workdir` (ssh) support `${VAR}` too (e.g. `host: 10.0.0.${SEG}`) —
+  (`SKA_*` system vars, step env, cross-step variable pool). `host`, `port`,
+  `user` and `workdir` (ssh) support `${VAR}` too (e.g. `host: 10.0.0.${SEG}`) —
   undefined variables are kept as-is, so a typo surfaces at dial time instead
-  of silently targeting a wrong host.
+  of silently targeting a wrong host. `port` may be written as a number or a
+  string (`port: 22` or `port: "${SERVER_PORT}"`); an invalid value is reported
+  before connecting.
 - Build cancellation / timeout closes the SSH connection automatically.
 
 ## Data Storage

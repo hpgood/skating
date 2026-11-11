@@ -369,3 +369,42 @@ pipeline:
 		t.Errorf("error should mention empty group, got: %q", err.Error())
 	}
 }
+
+// TestLoadPipeline_SSHPortTypes 验证 ssh/scp 的 port 同时接受字符串
+// （含 ${VAR}）与数字写法。
+func TestLoadPipeline_SSHPortTypes(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `name: demo
+pipeline:
+  stages:
+    - name: deploy
+      steps:
+        - name: ssh-step
+          type: ssh
+          host: "${SERVER_ADDRESS}"
+          port: "${SERVER_PORT}"
+          user: "${SERVER_USER}"
+          script: echo ok
+        - name: scp-step
+          type: scp
+          host: example.com
+          port: 22
+          user: deploy
+          local: dist
+          remote: /opt/dist
+`
+	if err := os.WriteFile(filepath.Join(dir, ".skating.yaml"), []byte(cfg), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	p, err := LoadPipeline(filepath.Join(dir, ".skating.yaml"))
+	if err != nil {
+		t.Fatalf("LoadPipeline: %v", err)
+	}
+	if got := p.Stages[0].Steps[0].Port; got != "${SERVER_PORT}" {
+		t.Errorf("ssh port = %v, want ${SERVER_PORT}", got)
+	}
+	if got := p.Stages[0].Steps[1].Port; got != 22 {
+		t.Errorf("scp port = %v, want int 22", got)
+	}
+}

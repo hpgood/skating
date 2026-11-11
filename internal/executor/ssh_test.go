@@ -4,7 +4,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
-	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -16,11 +15,51 @@ import (
 
 // --- 测试（in-process SSH server 见 internal/testssh） ---
 
+func TestResolveSSHPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    any
+		env     map[string]string
+		want    int
+		wantErr bool
+	}{
+		{name: "empty defaults to 22", want: 22},
+		{name: "int", port: 2222, want: 2222},
+		{name: "int zero defaults to 22", port: 0, want: 22},
+		{name: "numeric string", port: "2222", want: 2222},
+		{name: "string zero defaults to 22", port: "0", want: 22},
+		{name: "variable expansion", port: "${SSH_PORT}", env: map[string]string{"SSH_PORT": "2200"}, want: 2200},
+		{name: "undefined variable", port: "${SSH_PORT}", wantErr: true},
+		{name: "not a number", port: "abc", wantErr: true},
+		{name: "int out of range", port: 70000, wantErr: true},
+		{name: "string out of range", port: "70000", wantErr: true},
+		{name: "negative int", port: -1, wantErr: true},
+		{name: "negative string", port: "-1", wantErr: true},
+		{name: "unsupported type", port: true, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveSSHPort(Step{Name: "remote", Port: tt.port}, tt.env)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveSSHPort(%q) = %d, want error", tt.port, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSSHPort(%q): %v", tt.port, err)
+			}
+			if got != tt.want {
+				t.Errorf("resolveSSHPort(%q) = %d, want %d", tt.port, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRunner_ExecuteSsh_Password(t *testing.T) {
 	addr := testssh.Start(t, testssh.PasswordConfig("testuser", "testpass"))
 	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	r := NewRunner()
 	got := map[string]string{}
@@ -28,7 +67,7 @@ func TestRunner_ExecuteSsh_Password(t *testing.T) {
 
 	step := Step{
 		Name: "remote", Type: "ssh",
-		Host: host, Port: port, User: "testuser",
+		Host: host, Port: portStr, User: "testuser",
 		Auth:   "password",
 		Secret: "testpass",
 		Script: "echo \"::set-var TV=hello\"\necho done",
@@ -68,13 +107,11 @@ func TestRunner_ExecuteSsh_KeyAuth(t *testing.T) {
 
 	addr := testssh.Start(t, testssh.KeyConfig(signer.PublicKey()))
 	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	r := NewRunner()
 	step := Step{
 		Name: "remote", Type: "ssh",
-		Host: host, Port: port, User: "testuser",
+		Host: host, Port: portStr, User: "testuser",
 		Auth:   "key",
 		Secret: pemBytes,
 		Script: "echo ok",
@@ -91,13 +128,11 @@ func TestRunner_ExecuteSsh_KeyAuth(t *testing.T) {
 func TestRunner_ExecuteSsh_RemoteFailure(t *testing.T) {
 	addr := testssh.Start(t, testssh.PasswordConfig("testuser", "testpass"))
 	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	r := NewRunner()
 	step := Step{
 		Name: "remote", Type: "ssh",
-		Host: host, Port: port, User: "testuser",
+		Host: host, Port: portStr, User: "testuser",
 		Auth: "password", Secret: "testpass",
 		Script: "echo boom\necho REMOTE-FAIL",
 	}
@@ -116,13 +151,11 @@ func TestRunner_ExecuteSsh_RemoteFailure(t *testing.T) {
 func TestRunner_ExecuteSsh_BadPassword(t *testing.T) {
 	addr := testssh.Start(t, testssh.PasswordConfig("testuser", "testpass"))
 	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	r := NewRunner()
 	step := Step{
 		Name: "remote", Type: "ssh",
-		Host: host, Port: port, User: "testuser",
+		Host: host, Port: portStr, User: "testuser",
 		Auth: "password", Secret: "wrongpass",
 		Script: "echo hi",
 	}
@@ -188,14 +221,12 @@ func TestBuildRemoteScript(t *testing.T) {
 func TestRunner_ExecuteSsh_VarExpansion(t *testing.T) {
 	addr := testssh.Start(t, testssh.PasswordConfig("testuser", "testpass"))
 	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
 	seg := host[strings.LastIndex(host, ".")+1:]
 
 	r := NewRunner()
 	step := Step{
 		Name: "remote", Type: "ssh",
-		Host: "127.0.0.${SEG}", Port: port,
+		Host: "127.0.0.${SEG}", Port: portStr,
 		User: "${SSH_USER}",
 		Auth: "password", Secret: "testpass",
 		Script: "echo expanded-ok",

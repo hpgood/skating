@@ -524,6 +524,7 @@ steps:
   - name: remote-build
     type: ssh
     host: 10.0.0.1
+    port: "${SERVER_PORT}"       # 可选；默认 22；支持 ${VAR}
     user: deploy
     secret: deploy-pass          # password（默认）或 "key" 认证
     workdir: /opt/app
@@ -557,9 +558,10 @@ steps:
 - `sync` 只上传有变化的文件（按 size + mtime 秒级精度比较），且默认镜像
   本地目录：删除远端已不存在的文件。首次部署时远端目录可以不存在
 - `local` / `remote` 支持 `${VAR}` 变量展开（取自 step env 视图：
-  `SKA_*` 系统变量、step env、跨 step 变量池）。`host`、`user` 与 `workdir`
-  （ssh）同样支持 `${VAR}`（如 `host: 10.0.0.${SEG}`）——未定义变量保留原样，
-  拼错变量名会在连接时暴露原始值，而非静默连错主机
+  `SKA_*` 系统变量、step env、跨 step 变量池）。`host`、`port`、`user` 与
+  `workdir`（ssh）同样支持 `${VAR}`（如 `host: 10.0.0.${SEG}`）——未定义变量
+  保留原样，拼错变量名会在连接时暴露原始值，而非静默连错主机。`port` 可写
+  数字或字符串（`port: 22` / `port: "${SERVER_PORT}"`），非法值会在连接前报错
 - 构建取消/超时会自动关闭 SSH 连接
 
 ## 数据存储

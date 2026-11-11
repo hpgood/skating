@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,17 +12,15 @@ import (
 
 // startSftpServer 启动带 sftp subsystem 的测试服务器，
 // sftpRoot 为 sftp 操作的基准目录，返回 host/port/root
-func startSftpServer(t *testing.T) (string, int, string) {
+func startSftpServer(t *testing.T) (string, string, string) {
 	t.Helper()
 	root := t.TempDir()
 	addr := testssh.StartSftp(t, testssh.PasswordConfig("testuser", "testpass"), root)
-	host, portStr, _ := net.SplitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
+	host, port, _ := net.SplitHostPort(addr)
 	return host, port, root
 }
 
-func transferStep(typ, host string, port int) Step {
+func transferStep(typ, host, port string) Step {
 	return Step{
 		Name: "ship", Type: typ,
 		Host: host, Port: port, User: "testuser",

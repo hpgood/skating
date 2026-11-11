@@ -35,7 +35,11 @@ type Step struct {
 
 	// 以下为 SSH 远程执行字段（仅 type: ssh 生效）
 	Host string `yaml:"host"` // 远端主机（IP 或域名），必填
-	Port int    `yaml:"port"` // SSH 端口，缺省 22
+	// Port SSH 端口，同时支持整数与字符串：
+	//   port: 22
+	//   port: "${SERVER_PORT}"   # 字符串支持 ${VAR} 展开
+	// 留空或 0 时默认 22
+	Port any `yaml:"port"`
 	User string `yaml:"user"` // 登录用户，必填
 	// Auth 认证方式："password" 或 "key"，缺省 "password"
 	Auth string `yaml:"auth"`

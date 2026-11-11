@@ -204,7 +204,7 @@ pipeline:
           workdir: /work           # Container-side working directory (optional,
                                    # default /work; only for shell steps with image)
           host: 10.0.0.1           # SSH/SCP/Sync: remote host (required; supports ${VAR})
-          port: 22                 # SSH/SCP/Sync: remote port (optional, default 22)
+          port: "${SERVER_PORT}"   # SSH/SCP/Sync: remote port (optional, default 22; supports ${VAR})
           user: deploy             # SSH/SCP/Sync: login user (required; supports ${VAR})
           auth: password           # SSH/SCP/Sync: password|key (optional, default password)
           secret: deploy-pass      # SSH/SCP/Sync: global secret NAME (skating secret
@@ -252,7 +252,8 @@ pipeline:
   variables from default.
 - host: (ssh/scp/sync steps only, required) Remote host (IP or domain). Supports
   ${VAR} expansion (e.g. "10.0.0.${SEG}"); undefined variables are kept as-is.
-- port: (ssh/scp/sync steps only) Remote SSH port; default 22.
+- port: (ssh/scp/sync steps only) Remote SSH port; number or string, default 22.
+  Supports ${VAR} expansion (e.g. "${SERVER_PORT}").
 - user: (ssh/scp/sync steps only, required) Remote login user. Supports ${VAR}
   expansion; undefined variables are kept as-is.
 - auth: (ssh/scp/sync steps only) "password" or "key"; default "password". With
@@ -770,7 +771,7 @@ pipeline:
           workdir: /work           # 容器内工作目录（可选，默认 /work；
                                    # 仅对配置了 image 的 shell 步骤生效）
           host: 10.0.0.1           # SSH/SCP/Sync：远端主机（必填；支持 ${VAR}）
-          port: 22                 # SSH/SCP/Sync：远端端口（可选，默认 22）
+          port: "${SERVER_PORT}"   # SSH/SCP/Sync：远端端口（可选，默认 22；支持 ${VAR}）
           user: deploy             # SSH/SCP/Sync：登录用户（必填；支持 ${VAR}）
           auth: password           # SSH/SCP/Sync：password|key（可选，默认 password）
           secret: deploy-pass      # SSH/SCP/Sync：全局 secret 名（skating secret
@@ -814,7 +815,8 @@ pipeline:
   平台组覆盖 default 中同名变量
 - host：（仅 ssh/scp/sync 步骤，必填）远端主机（IP 或域名）。支持 ${VAR} 展开
   （如 "10.0.0.${SEG}"）；未定义变量保留原样
-- port：（仅 ssh/scp/sync 步骤）远端 SSH 端口；默认 22
+- port：（仅 ssh/scp/sync 步骤）远端 SSH 端口；数字或字符串，默认 22。
+  支持 ${VAR} 展开（如 "${SERVER_PORT}"）
 - user：（仅 ssh/scp/sync 步骤，必填）登录用户。支持 ${VAR} 展开；
   未定义变量保留原样
 - auth：（仅 ssh/scp/sync 步骤）"password" 或 "key"；默认 "password"。为 "key" 时

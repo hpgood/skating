@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,62 @@ func (r *Runner) runSsh(step Step, env map[string]string, logFn func(msg string)
 	return output, nil
 }
 
+// resolveSSHPort 解析远端端口，同时支持整数与字符串：
+//   - 整数：直接校验范围
+//   - 字符串：先做 ${VAR} 展开，再按数字解析
+//
+// 空值或 0 默认 22，非法值返回明确错误。
+func resolveSSHPort(step Step, env map[string]string) (int, error) {
+	var port int
+	switch v := step.Port.(type) {
+	case nil:
+		return 22, nil
+	case int:
+		port = v
+	case int8:
+		port = int(v)
+	case int16:
+		port = int(v)
+	case int32:
+		port = int(v)
+	case int64:
+		port = int(v)
+	case uint:
+		port = int(v)
+	case uint8:
+		port = int(v)
+	case uint16:
+		port = int(v)
+	case uint32:
+		port = int(v)
+	case uint64:
+		if v > 65535 {
+			return 0, fmt.Errorf("step %q: ssh port %d out of range (1-65535)", step.Name, v)
+		}
+		port = int(v)
+	case string:
+		raw := strings.TrimSpace(expandVars(v, env))
+		if raw == "" {
+			return 22, nil
+		}
+		p, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, fmt.Errorf("step %q: invalid ssh port %q (want number)", step.Name, raw)
+		}
+		port = p
+	default:
+		return 0, fmt.Errorf("step %q: invalid ssh port %v (want int or string)", step.Name, v)
+	}
+
+	if port == 0 {
+		return 22, nil
+	}
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("step %q: ssh port %d out of range (1-65535)", step.Name, port)
+	}
+	return port, nil
+}
+
 // dialSSH 建立到远端的 SSH 连接，供 ssh/scp/sync 步骤共用：
 // 校验 host/user/secret 必填项（host/user 支持 ${VAR} 变量展开），
 // host key 校验采用 accept-all（CI 工具常见做法，内部服务器/云主机场景省事），
@@ -72,9 +129,9 @@ func (r *Runner) dialSSH(step Step, env map[string]string) (*sshConn, error) {
 		return nil, fmt.Errorf("step %q: ssh secret is required (skating secret set <name>)", step.Name)
 	}
 
-	port := step.Port
-	if port == 0 {
-		port = 22
+	port, err := resolveSSHPort(step, env)
+	if err != nil {
+		return nil, err
 	}
 
 	authMethods, err := sshAuthMethods(step.Auth, step.Secret)

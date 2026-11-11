@@ -26,7 +26,9 @@ type Step struct {
 
 	// 以下为 SSH 远程执行配置（仅 type: ssh 生效）
 	Host string // 远端主机（IP 或域名），必填
-	Port int    // SSH 端口；0 表示 22
+	// Port SSH 端口，同时支持整数与字符串
+	// （字符串支持 ${VAR} 展开）；留空或 0 表示 22
+	Port any
 	User string // 登录用户，必填
 	// Auth 认证方式："password" 或 "key"，空为 "password"
 	Auth string
