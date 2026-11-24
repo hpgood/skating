@@ -5,9 +5,10 @@
 ## 特性
 
 - **一键安装** — 单二进制文件，无需数据库，数据存储于本地 YAML 文件
-- **三层架构** — Pipeline DSL 编排 + Shell/Lua/SSH/SCP/Sync 执行引擎 + Yaegi 插件扩展
+- **三层架构** — Pipeline DSL 编排 + Shell/Lua/SSH/SCP/Sync/Sign 执行引擎 + Yaegi 插件扩展
 - **Docker 沙箱** — 在容器内隔离构建，环境一致
 - **远程部署** — 原生 SSH 执行器 + 基于 SFTP 的 scp/sync 文件传输
+- **产物签名** — 内置 RSA/ECDSA/Ed25519 detached 签名与验签，密钥来自 skating secret
 - **跨平台** — Windows / Linux / macOS 全支持
 
 ## Skating vs Drone
@@ -312,7 +313,7 @@ skating stop training 102     # 显式指定项目
 ┌─────────────────────────────┐
 │  Pipeline DSL (YAML)        │  ← Stage / Parallel / When 编排
 ├─────────────────────────────┤
-│  执行引擎                    │  ← Shell + Lua + SSH/SCP/Sync
+│  执行引擎                    │  ← Shell + Lua + SSH/SCP/Sync + Sign/Verify
 ├─────────────────────────────┤
 │  插件扩展 (Yaegi)            │  ← Go 插件动态加载，通知/审查等
 └─────────────────────────────┘
@@ -562,7 +563,66 @@ steps:
   `workdir`（ssh）同样支持 `${VAR}`（如 `host: 10.0.0.${SEG}`）——未定义变量
   保留原样，拼错变量名会在连接时暴露原始值，而非静默连错主机。`port` 可写
   数字或字符串（`port: 22` / `port: "${SERVER_PORT}"`），非法值会在连接前报错
+- SSH 脚本通过远端 `bash -x -s` 执行，每条命令都会以 `+ ...` 形式输出到实时
+  日志，便于排查远端执行过程
 - 构建取消/超时会自动关闭 SSH 连接
+
+## 数字签名（Sign / Verify）
+
+`type: sign` 为单个文件生成 detached 签名，`type: verify` 负责验签。两者均为
+内置能力（无需外部 `gpg`/`openssl` 可执行文件），只依赖 `golang.org/x/crypto`
+与标准库。
+
+私钥用 `skating secret set <name> --from-file <keyfile>` 保存，yaml 中只引用
+名字；密钥内容不会出现在 yaml 或日志中。
+
+```yaml
+steps:
+  - name: sign-artifact
+    type: sign
+    secret: release-signing-key      # 必填；私钥名
+    file: dist/app.tar.gz            # 必填；支持 ${VAR}
+    output: dist/app.tar.gz.sig      # 可选；默认 <file>.sig
+    algorithm: rsa-sha256            # 可选；缺省按私钥类型自动识别
+
+  - name: verify-artifact
+    type: verify
+    file: dist/app.tar.gz            # 必填
+    signature: dist/app.tar.gz.sig   # 可选；默认 <file>.sig
+    public_key: keys/release.pub     # public_key 与 secret 二选一
+    # secret: release-pub            # 或：公钥 PEM 存在 skating secret 中
+    algorithm: rsa-sha256            # 可选；缺省按公钥类型自动识别
+```
+
+算法（未显式指定 `algorithm` 时按密钥类型自动识别）：
+
+| 密钥类型 | 算法 | 签名编码 |
+|---|---|---|
+| RSA | `rsa-sha256`（PKCS#1 v1.5 + SHA-256） | raw bytes |
+| ECDSA | `ecdsa-sha256`（SHA-256） | ASN.1 DER |
+| Ed25519 | `ed25519` | raw bytes |
+
+行为说明：
+- 密钥格式：私钥支持 x509 PEM（PKCS#8 / PKCS#1 / SEC1）与 OpenSSH 私钥；
+  公钥支持 PKIX / PKCS#1 PEM 或 OpenSSH `.pub`（authorized_keys）
+- `file` / `output` / `signature` / `public_key` 相对项目目录解析（与 shell
+  步骤一致），支持 `${VAR}` 展开；未定义变量保留原样
+- `.sig` 为单行标准 base64（带 padding）并以 `\n` 结尾。验签时忽略首尾空白，
+  同时兼容去 padding 的 base64（如 `openssl base64 -A` 的输出）
+- 已存在的 `.sig` 直接覆盖；`output` 的父目录不存在时自动创建
+- `verify` 的 `public_key` 与 `secret` 必须且只能填一个；验签不匹配会使
+  step（及构建）失败，解析/格式错误会说明期望的密钥类型
+- 不支持带口令的加密私钥；请先解密（如
+  `openssl pkey -in key.pem -out plain.pem`）
+- Ed25519 需要把整个文件读入内存；超大产物建议用 RSA/ECDSA（流式计算 SHA-256）
+- 签名针对文件原始字节，Windows/Linux 跨平台对同一文件字节一致
+
+用 OpenSSL 交叉验证（以 RSA 密钥为例）：
+```bash
+# 用公钥校验 skating 生成的 .sig
+openssl dgst -sha256 -verify keys/release.pem \
+  -signature dist/app.tar.gz.sig dist/app.tar.gz
+```
 
 ## 数据存储
 

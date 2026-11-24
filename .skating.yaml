@@ -115,6 +115,38 @@ pipeline:
     - name: deploy
       description: "部署到远端服务器"
       parallel: false
-      when: false
-
+      when: true
+      steps:
+        - name: deploy-139.78
+          type: scp
+          host: 192.168.139.78
+          user: root
+          secret: deploy-139-78
+          local: build/skating
+          remote: /usr/bin/skating
+        - name: permission-78
+          type: ssh
+          host: 192.168.139.78
+          user: root
+          port: 22
+          secret: deploy-139-78
+          script: |
+            chmod +x /usr/bin/skating
+            ls -la /usr/bin/skating
+        - name: deploy-139.79
+          type: scp
+          host: 192.168.139.79
+          user: root
+          secret: deploy-139-79
+          local: build/skating
+          remote: /usr/bin/skating
+        - name: permission-79
+          type: ssh
+          host: 192.168.139.79
+          user: root
+          port: 22
+          secret: deploy-139-79
+          script: |
+            chmod +x /usr/bin/skating
+            ls -la /usr/bin/skating
           

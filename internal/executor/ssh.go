@@ -35,10 +35,12 @@ func (r *Runner) runSsh(step Step, env map[string]string, logFn func(msg string)
 	session.Stdout = stdoutW
 	session.Stderr = stderrW
 
-	// 脚本通过 stdin 喂给远端 bash，规避命令行长度与引号转义问题
+	// 脚本通过 stdin 喂给远端 bash，规避命令行长度与引号转义问题。
+	// -x 开启命令追踪（与 shell 步骤的 bash -x 一致），每条命令以 "+ ..."
+	// 打印到 stderr，经 lineStreamer 实时进入日志，便于排查远端执行过程。
 	session.Stdin = strings.NewReader(buildRemoteScript(step, env))
 
-	err = session.Run("bash -s")
+	err = session.Run("bash -x -s")
 	stdoutW.flush()
 	stderrW.flush()
 	output := stdoutW.String() + stderrW.String()

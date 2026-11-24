@@ -45,11 +45,16 @@ func TestExamplesParse(t *testing.T) {
 					if step.Name == "" {
 						t.Error("step name 为空")
 					}
-					if step.Type != "shell" && step.Type != "lua" {
-						t.Errorf("未知的 step type: %q (应为 shell 或 lua)", step.Type)
-					}
-					if step.Script == "" && step.Source == "" {
-						t.Errorf("step %q 既没有 script 也没有 source", step.Name)
+					switch step.Type {
+					case "shell", "lua", "ssh":
+						// 这三类步骤依赖脚本内容（内联或外部文件）
+						if step.Script == "" && step.Source == "" {
+							t.Errorf("step %q 既没有 script 也没有 source", step.Name)
+						}
+					case "scp", "sync", "sign", "verify":
+						// 文件传输/签名步骤使用各自字段，不要求 script/source
+					default:
+						t.Errorf("未知的 step type: %q (应为 shell、lua、ssh、scp、sync、sign 或 verify)", step.Type)
 					}
 				}
 			}

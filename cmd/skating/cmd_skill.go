@@ -26,14 +26,16 @@ const skillDocEn = `# SKATING SKILL
 
 ## Overview
 Skating is a lightweight CI/CD automation tool. It uses a YAML-based pipeline DSL
-with Shell, Lua, SSH and file-transfer (scp/sync) executors, and stores all data
-as local YAML files (no database required).
+with Shell, Lua, SSH, file-transfer (scp/sync) and digital-signature (sign/verify)
+executors, and stores all data as local YAML files (no database required).
 When a shell step configures a docker image (step-level "image") and docker CLI is
 available on the host, that step runs inside a one-shot "docker run --rm" container
 (workdir mounted, env injected). Otherwise the step falls back to running directly
 on the host shell. Different steps may use different images. SSH steps run bash
 scripts on a remote server over a native SSH connection. scp/sync steps transfer
 files between local and remote over SFTP (scp semantics / rsync-like sync).
+sign/verify steps produce and check detached RSA/ECDSA/Ed25519 signatures for a
+single file, with keys resolved from skating secrets.
 
 ## Commands
 
@@ -84,7 +86,7 @@ Workflow:
    still succeeds) before any step filter or goroutine starts
 5. For each step: evaluate the When condition (if any), merge stage-level env
    then step-level env (both platform-aware; step overrides stage on conflicts),
-   then dispatch to the shell, lua, ssh, scp or sync executor
+   then dispatch to the shell, lua, ssh, scp, sync, sign or verify executor
 6. Stream output to the terminal line-by-line and buffer it for log persistence
 7. Save log to ~/.skating/logs/<project>/<buildID>.log (plain text, ANSI stripped)
 8. Update project status and timestamp in projects.yaml
@@ -145,12 +147,13 @@ already gone. Project name is optional (defaults to the current directory).
 Use skating stats to find the PROJECT and BUILD# first.
 
 ### skating secret set/list/delete
-Manage global secrets (ssh passwords / private keys) stored in
-~/.skating/secrets.json (file mode 0600). Secrets are referenced by name from
-pipeline yaml — the yaml never contains the secret value itself.
+Manage global secrets (ssh passwords / private keys, sign private keys, verify
+public keys) stored in ~/.skating/secrets.json (file mode 0600). Secrets are
+referenced by name from pipeline yaml — the yaml never contains the secret value
+itself.
 - set <name>: store a value. Sources (mutually exclusive): --value <v>,
   --from-file <path>, or omit both for a hidden terminal prompt (no echo,
-  nothing in shell history). For private keys use --from-file.
+  nothing in shell history). For keys use --from-file.
 - list: show names and timestamps only (never values)
 - delete <name>: remove a secret
 
@@ -195,7 +198,7 @@ pipeline:
           Ext: ".exe"
       steps:
         - name: step-name
-          type: shell|lua|ssh|scp|sync  # Executor type
+          type: shell|lua|ssh|scp|sync|sign|verify  # Executor type
           image: docker-image:tag  # Optional step-level docker image (shell steps
                                    # only); empty = run on host shell. Steps may
                                    # use different images
@@ -214,6 +217,16 @@ pipeline:
           remote: /opt/app/        # SCP/Sync only: remote path (supports ${VAR})
           delete: true             # Sync only: remove remote files missing locally
                                    # (optional, default true)
+          file: dist/app.tar.gz    # Sign/Verify: file to sign or check (required;
+                                   # supports ${VAR})
+          output: dist/app.sig     # Sign only: signature path (optional; default
+                                   # <file>.sig; supports ${VAR})
+          signature: dist/app.sig  # Verify only: signature path (optional; default
+                                   # <file>.sig; supports ${VAR})
+          public_key: keys/rel.pub # Verify only: public key file, or use secret
+                                   # instead (exactly one; supports ${VAR})
+          algorithm: rsa-sha256    # Sign/Verify: rsa-sha256|ecdsa-sha256|ed25519
+                                   # (optional; auto-detected from the key)
           script: |         # Inline script content
             echo "hello"
           source: path/script.sh  # External script path (alternative to script)
@@ -229,7 +242,7 @@ pipeline:
 
 ### Step Fields
 - name: (required) Unique step name within the stage
-- type: (required) "shell", "lua", "ssh", "scp" or "sync"
+- type: (required) "shell", "lua", "ssh", "scp", "sync", "sign" or "verify"
 - script: Inline script content. For shell: bash commands. For lua: Lua code.
   For ssh: bash commands run on the remote server.
 - source: Path to external script file. Mutually exclusive with script (use one).
@@ -258,9 +271,11 @@ pipeline:
   expansion; undefined variables are kept as-is.
 - auth: (ssh/scp/sync steps only) "password" or "key"; default "password". With
   "key" the secret holds a PEM private key.
-- secret: (ssh/scp/sync steps only, required) NAME of a global secret created
-  with "skating secret set <name>". The actual password/key is resolved from
-  ~/.skating/secrets.json at runtime — it never appears in the yaml or in logs.
+- secret: (ssh/scp/sync/sign/verify steps) NAME of a global secret created with
+  "skating secret set <name>". Required for ssh/scp/sync/sign; for verify it is
+  an alternative to public_key (exactly one). The actual password/private
+  key/public key is resolved from ~/.skating/secrets.json at runtime — it never
+  appears in the yaml or in logs.
 - direction: (scp steps only) "push" (local -> remote, default) or "pull"
   (remote -> local).
 - local: (scp/sync steps only, required) Local path. ${VAR} variables are
@@ -269,6 +284,17 @@ pipeline:
 - remote: (scp/sync steps only, required) Remote path; also ${VAR}-expanded.
 - delete: (sync steps only) Mirror deletion — remove remote files/dirs that no
   longer exist locally. Default true; set false to only add/update remote files.
+- file: (sign/verify steps only, required) File to sign or check. ${VAR}
+  expanded and resolved relative to the project directory.
+- output: (sign steps only, optional) Signature file path; default <file>.sig.
+  ${VAR}-expanded; parent directories are created automatically.
+- signature: (verify steps only, optional) Signature file path; default
+  <file>.sig. ${VAR}-expanded.
+- public_key: (verify steps only) Public key file (PEM PKIX/PKCS#1 or OpenSSH
+  .pub). Exactly one of public_key or secret must be set. ${VAR}-expanded.
+- algorithm: (sign/verify steps only, optional) "rsa-sha256", "ecdsa-sha256" or
+  "ed25519" (case-insensitive). Default: auto-detected from the key; an explicit
+  value that does not match the key type fails the step.
 
 ### Stage Fields
 - name: (required) Stage name
@@ -391,9 +417,11 @@ Behavior:
   are never logged
 - Host key check: accept-all (InsecureIgnoreHostKey) — suitable for internal
   servers; the dial timeout is 30s
-- The script is fed to remote "bash -s" via stdin (no command-line length or
-  quoting limits). Step env (SKA_* + step env + cross-step pool) is injected as
-  export lines before the script
+- The script is fed to remote "bash -x -s" via stdin (no command-line length or
+  quoting limits). The -x flag traces every remote command ("+ ..." lines on
+  stderr), so the live log shows the commands as they execute. Step env
+  (SKA_* + step env + cross-step pool) is injected as export lines before the
+  script
 - workdir: the remote runs "cd <workdir>" before the script (supports ${VAR}
   expansion, e.g. "/opt/${APP}")
 - host/user support ${VAR} expansion from the step env view (SKA_* + step env +
@@ -457,6 +485,49 @@ Behavior:
   "[sync] local → remote: uploaded N, skipped N, removed N (SIZE)"
 - Authentication, secret resolution, host key policy, 30s dial timeout and
   build-context cancellation behave exactly as in SSH steps
+
+## Sign / Verify Executor
+sign (type: sign) produces a detached signature for a single file and writes it
+to <file>.sig (or the "output" path). verify (type: verify) checks such a
+signature against a public key. Built in — no external gpg/openssl binary.
+
+Example:
+` + "```yaml" + `
+steps:
+  - name: sign-artifact
+    type: sign
+    secret: release-signing-key        # required; private key saved via skating secret
+    file: dist/app.tar.gz              # required; ${VAR} supported
+    output: dist/app.tar.gz.sig        # optional; default <file>.sig
+    algorithm: rsa-sha256              # optional; auto-detected from the key
+
+  - name: verify-artifact
+    type: verify
+    file: dist/app.tar.gz              # required
+    signature: dist/app.tar.gz.sig     # optional; default <file>.sig
+    public_key: keys/release.pub       # or secret instead (exactly one)
+    # secret: release-pub
+` + "```" + `
+
+Behavior:
+- Algorithms: RSA -> rsa-sha256 (PKCS#1 v1.5 + SHA-256); ECDSA -> ecdsa-sha256
+  (ASN.1 DER signature); Ed25519 -> ed25519. Auto-detected from the private/
+  public key unless "algorithm" is set; an explicit mismatch fails the step.
+- Key formats: private keys may be x509 PEM (PKCS#8 / PKCS#1 / SEC1) or OpenSSH
+  private keys; public keys may be PKIX / PKCS#1 PEM or OpenSSH .pub.
+  Encrypted (passphrase-protected) private keys are rejected — decrypt first.
+- The .sig file is one standard base64 line (with padding) plus a trailing
+  newline. Verification trims whitespace and also accepts base64 without
+  padding. Existing .sig files are overwritten.
+- file/output/signature/public_key are ${VAR}-expanded and resolved relative to
+  the project directory (same base as shell steps); undefined variables are
+  kept as-is.
+- verify needs exactly one of public_key / secret; both empty or both set fails
+  the step. A signature mismatch fails the step (and the build).
+- RSA/ECDSA stream the SHA-256 hash; Ed25519 reads the whole file into memory
+  (prefer RSA/ECDSA for very large artifacts). Signatures cover raw bytes.
+- Log summaries: "[sign] <file> -> <output> (<algorithm>)" and
+  "[verify] <file> OK (<algorithm>)". Secret values are never logged.
 
 ## Lua Executor (Gopher-Lua)
 Runs Lua scripts in-process using the gopher-lua VM. The following APIs are exposed to Lua:
@@ -556,8 +627,9 @@ projects:
 
 ~/.skating/logs/<project>/<N>.log   Plain text build logs, one file per build ID.
 
-~/.skating/secrets.json             Global secrets (ssh passwords / private keys),
-                                    file mode 0600. Managed by skating secret set/list/delete.
+~/.skating/secrets.json             Global secrets (ssh passwords / private keys,
+                                    sign/verify keys), file mode 0600. Managed by
+                                    skating secret set/list/delete.
 
 ## Plugins (Yaegi)
 - Builtin ConsoleNotifier prints build result summary after each build
@@ -609,13 +681,14 @@ const skillDocZhCN = `# SKATING SKILL（中文）
 
 ## 概述
 Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水线 DSL，
-配合 Shell、Lua、SSH 与文件传输（scp/sync）执行器，所有数据以本地 YAML
-文件存储（无需数据库）。
+配合 Shell、Lua、SSH、文件传输（scp/sync）与数字签名（sign/verify）执行器，
+所有数据以本地 YAML 文件存储（无需数据库）。
 当 shell 步骤配置了 step 级 docker 镜像（"image"）且主机上存在 docker CLI 时，
 该步骤会在一次性 "docker run --rm" 容器内运行（挂载工作目录、注入环境变量）；
 否则直接在 host shell 执行。不同步骤可以使用不同镜像。SSH 步骤通过原生 SSH
 连接在远程服务器上执行 bash 脚本。scp/sync 步骤通过 SFTP 在本地与远端之间
-传输文件（scp 语义 / rsync 式同步）。
+传输文件（scp 语义 / rsync 式同步）。sign/verify 步骤为单个文件生成并校验
+RSA/ECDSA/Ed25519 detached 签名，密钥从 skating secret 中解析。
 
 ## 命令
 
@@ -659,7 +732,8 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
    时整段跳过（所有 Step 记为 skipped，构建仍为成功），且不会启动任何 Step 过滤或
    goroutine
 5. 对每个 Step：评估 When 条件（如有），再合并 step 级 env（按平台解析；
-   同名变量 step 覆盖 stage），最后分发到 shell、lua、ssh、scp 或 sync 执行器
+   同名变量 step 覆盖 stage），最后分发到 shell、lua、ssh、scp、sync、sign
+   或 verify 执行器
 6. 输出按行实时流式转发到终端，同时缓冲用于日志持久化
 7. 将日志保存到 ~/.skating/logs/<项目名>/<buildID>.log（纯文本，已剥离 ANSI）
 8. 更新 projects.yaml 中的项目状态和时间戳
@@ -713,11 +787,12 @@ Skating 是一个轻量级 CI/CD 自动化工具。使用基于 YAML 的流水�
 先用 skating stats 查看 PROJECT 与 BUILD#。
 
 ### skating secret set/list/delete
-管理全局 secret（SSH 密码/私钥），存储在 ~/.skating/secrets.json（文件权限
-0600）。流水线 yaml 通过名字引用 secret——yaml 中永远不出现 secret 的值本身。
+管理全局 secret（SSH 密码/私钥、sign 签名私钥、verify 验签公钥），存储在
+~/.skating/secrets.json（文件权限 0600）。流水线 yaml 通过名字引用 secret——
+yaml 中永远不出现 secret 的值本身。
 - set <name>：存储一个值。来源（互斥）：--value <v>、--from-file <path>，
   或两者都省略以使用隐藏式终端输入（不回显、不进 shell history）。
-  私钥请用 --from-file
+  密钥请用 --from-file
 - list：仅显示名字和时间戳（从不显示值）
 - delete <name>：删除一个 secret
 
@@ -762,7 +837,7 @@ pipeline:
           Ext: ".exe"
       steps:
         - name: step-name
-          type: shell|lua|ssh|scp|sync  # 执行器类型
+          type: shell|lua|ssh|scp|sync|sign|verify  # 执行器类型
           image: docker-image:tag  # 可选的 step 级 docker 镜像（仅对 shell 步骤
                                    # 生效）；为空则在 host shell 执行。不同步骤
                                    # 可使用不同镜像
@@ -781,6 +856,16 @@ pipeline:
           remote: /opt/app/        # 仅 SCP/Sync：远端路径（支持 ${VAR}）
           delete: true             # 仅 Sync：删除本地已不存在的远端文件
                                    # （可选，默认 true）
+          file: dist/app.tar.gz    # Sign/Verify：待签名/验签文件（必填；
+                                   # 支持 ${VAR}）
+          output: dist/app.sig     # 仅 Sign：签名输出路径（可选；默认
+                                   # <file>.sig；支持 ${VAR}）
+          signature: dist/app.sig  # 仅 Verify：签名文件路径（可选；默认
+                                   # <file>.sig；支持 ${VAR}）
+          public_key: keys/rel.pub # 仅 Verify：公钥文件，也可改用 secret
+                                   # （二选一；支持 ${VAR}）
+          algorithm: rsa-sha256    # Sign/Verify：rsa-sha256|ecdsa-sha256|ed25519
+                                   # （可选；按密钥类型自动识别）
           script: |         # 内联脚本内容
             echo "hello"
           source: path/script.sh  # 外部脚本路径（与 script 二选一）
@@ -796,7 +881,7 @@ pipeline:
 
 ### Step 字段说明
 - name：（必填）Stage 内唯一的 Step 名称
-- type：（必填）"shell"、"lua"、"ssh"、"scp" 或 "sync"
+- type：（必填）"shell"、"lua"、"ssh"、"scp"、"sync"、"sign" 或 "verify"
 - script：内联脚本内容。shell 类型为 bash 命令，lua 类型为 Lua 代码，
   ssh 类型为在远端服务器上运行的 bash 命令
 - source：外部脚本文件路径。与 script 互斥（只能使用一个）
@@ -821,8 +906,9 @@ pipeline:
   未定义变量保留原样
 - auth：（仅 ssh/scp/sync 步骤）"password" 或 "key"；默认 "password"。为 "key" 时
   secret 存 PEM 私钥
-- secret：（仅 ssh/scp/sync 步骤，必填）全局 secret 名，用 "skating secret set
-  <name>" 创建。真实密码/私钥运行时从 ~/.skating/secrets.json resolve
+- secret：（ssh/scp/sync/sign/verify 步骤）全局 secret 名，用 "skating secret set
+  <name>" 创建。ssh/scp/sync/sign 必填；verify 时作为 public_key 的替代品
+  （二选一）。真实密码/私钥/公钥运行时从 ~/.skating/secrets.json resolve
   ——yaml 和日志中永远不会出现
 - direction：（仅 scp 步骤）"push"（本地→远端，默认）或 "pull"（远端→本地）
 - local：（仅 scp/sync 步骤，必填）本地路径。支持 ${VAR} 变量展开（取自 step
@@ -830,6 +916,16 @@ pipeline:
 - remote：（仅 scp/sync 步骤，必填）远端路径；同样支持 ${VAR} 展开
 - delete：（仅 sync 步骤）镜像删除——移除本地已不存在的远端文件/目录。
   默认 true；设为 false 则只新增/更新远端文件
+- file：（仅 sign/verify 步骤，必填）待签名/验签文件。支持 ${VAR} 展开，
+  相对路径基于项目目录解析
+- output：（仅 sign，可选）签名输出路径；默认 <file>.sig。支持 ${VAR}；
+  父目录不存在时自动创建
+- signature：（仅 verify，可选）签名文件路径；默认 <file>.sig。支持 ${VAR}
+- public_key：（仅 verify）公钥文件（PKIX/PKCS#1 PEM 或 OpenSSH .pub）。
+  public_key 与 secret 必须且只能填一个。支持 ${VAR}
+- algorithm：（仅 sign/verify，可选）"rsa-sha256"、"ecdsa-sha256" 或
+  "ed25519"（大小写不敏感）。默认按密钥类型自动识别；显式值与密钥类型
+  不匹配时 step 失败
 
 ### Stage 字段说明
 - name：（必填）Stage 名称
@@ -943,7 +1039,8 @@ steps:
   （0600 权限），运行时 resolve。secret 值永不写入日志
 - Host key 校验：accept-all（InsecureIgnoreHostKey）——适合内网服务器；
   连接超时 30s
-- 脚本经 stdin 喂给远端 "bash -s"（无命令行长度/引号转义限制）。
+- 脚本经 stdin 喂给远端 "bash -x -s"（无命令行长度/引号转义限制）。-x 会追踪
+  每条远端命令（stderr 上的 "+ ..." 行），实时日志可看到命令执行过程。
   step env（SKA_* + step env + 跨 step 变量池）以 export 行注入到脚本之前
 - workdir：远端在脚本执行前先 "cd <workdir>"（支持 ${VAR} 展开，如 "/opt/${APP}"）
 - host/user 支持从 step env 视角（SKA_* + step env + 跨 step 变量池）做 ${VAR}
@@ -1000,6 +1097,47 @@ steps:
   "[sync] local → remote: uploaded N, skipped N, removed N (SIZE)"
 - 认证、secret 解析、host key 策略、30s 连接超时与构建上下文取消
   与 SSH 步骤完全一致
+
+## Sign / Verify 执行器
+sign（type: sign）为单个文件生成 detached 签名并写入 <file>.sig（或 output
+指定路径）；verify（type: verify）用公钥校验该签名。均为内置能力，无需外部
+gpg/openssl 可执行文件。
+
+示例：
+` + "```yaml" + `
+steps:
+  - name: sign-artifact
+    type: sign
+    secret: release-signing-key        # 必填；私钥经 skating secret 保存
+    file: dist/app.tar.gz              # 必填；支持 ${VAR}
+    output: dist/app.tar.gz.sig        # 可选；默认 <file>.sig
+    algorithm: rsa-sha256              # 可选；按私钥类型自动识别
+
+  - name: verify-artifact
+    type: verify
+    file: dist/app.tar.gz              # 必填
+    signature: dist/app.tar.gz.sig     # 可选；默认 <file>.sig
+    public_key: keys/release.pub       # 或改用 secret（二选一）
+    # secret: release-pub
+` + "```" + `
+
+行为：
+- 算法：RSA → rsa-sha256（PKCS#1 v1.5 + SHA-256）；ECDSA → ecdsa-sha256
+  （ASN.1 DER 签名）；Ed25519 → ed25519。未显式设置 algorithm 时按私钥/公钥
+  类型自动识别；显式值与密钥类型不匹配时 step 失败
+- 密钥格式：私钥支持 x509 PEM（PKCS#8 / PKCS#1 / SEC1）与 OpenSSH 私钥；
+  公钥支持 PKIX / PKCS#1 PEM 或 OpenSSH .pub。带口令的加密私钥不支持，
+  需先解密
+- .sig 为单行标准 base64（带 padding）+ 末尾换行。验签忽略首尾空白，也兼容
+  去 padding 的 base64。已存在的 .sig 直接覆盖
+- file/output/signature/public_key 支持 ${VAR} 展开，相对路径基于项目目录
+  （与 shell 步骤一致）；未定义变量保留原样
+- verify 的 public_key 与 secret 必须且只能填一个；两者都空或都填会失败。
+  验签不匹配会使 step（及构建）失败
+- RSA/ECDSA 流式计算 SHA-256；Ed25519 需整文件读入内存（超大产物建议选
+  RSA/ECDSA）。签名针对文件原始字节
+- 日志摘要："[sign] <file> -> <output> (<algorithm>)" 与
+  "[verify] <file> OK (<algorithm>)"；secret 值永不写入日志
 
 ## Lua 执行器 (Gopher-Lua)
 使用 gopher-lua 虚拟机在进程内运行 Lua 脚本。向 Lua 暴露以下 API：
@@ -1097,8 +1235,8 @@ projects:
 
 ~/.skating/logs/<项目名>/<N>.log   纯文本构建日志，每个构建 ID 一个文件。
 
-~/.skating/secrets.json      全局 secret（SSH 密码/私钥），文件权限 0600，
-                             由 skating secret set/list/delete 管理。
+~/.skating/secrets.json      全局 secret（SSH 密码/私钥、sign/verify 密钥），
+                             文件权限 0600，由 skating secret set/list/delete 管理。
 
 ## 插件系统 (Yaegi)
 - 内置 ConsoleNotifier 在每次构建后打印结果摘要

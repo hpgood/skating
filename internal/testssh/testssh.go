@@ -1,5 +1,5 @@
 // Package testssh 提供进程内 SSH 测试服务器：真实 ssh 协议握手
-// （ed25519 host key），把 "bash -s" 从 stdin 收到的脚本按行模拟执行。
+// （ed25519 host key），把通过 stdin 收到的脚本按行模拟执行。
 // 仅供测试使用（依赖 testing），不参与生产构建路径。
 package testssh
 
@@ -131,7 +131,7 @@ func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, sftpRoot string) {
 			}
 			started = true
 
-			// 读 stdin 直到 EOF（bash -s 从 stdin 收脚本）
+			// 读 stdin 直到 EOF（bash [-x] -s 从 stdin 收脚本）
 			data, _ := io.ReadAll(ch)
 			script := string(data)
 

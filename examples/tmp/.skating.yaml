@@ -1,0 +1,46 @@
+name: "tq-microservices-support_services-system-monitor-service"
+timeout: 60m
+
+pipeline:
+  groups:
+    all:
+      stages: [deploy]
+      description: "Build image and deploy (push=no saves tar.gz and uploads it)"
+ 
+  stages:
+    - name: deploy
+      description: "Update SYSTEM_MONITOR_IMAGE in .env and restart docker-compose on the remote hosts"
+      parallel: false
+      env:
+        default:
+          PROJECT_NAME: tq5
+          CODE_REPO: tq-microservices-support_services-system-monitor-service
+          REGISTRY: 192.168.137.57:53001
+          DEPLOY_PATH: /opt/tq_deploy/latest/
+          COMPOSE_FILE: docker-compose-support.yaml
+          ENV_IMAGE_NAME: SYSTEM_MONITOR_IMAGE
+          COMPOSE_BIN: /usr/bin/docker-compose
+          SERVER_ADDRESS: "127.0.0.1"
+          SERVER_USER: "root"
+          SERVER_PORT_1: "40022"
+          SERVER_PORT_2: ""
+          SERVER_PORT_3: ""
+          push: "no"
+      steps:
+        - name: build
+          type: shell
+          script: |
+            echo "Building image..."
+            touch /tmp/1.txt
+            echo "Hello, World!" > /tmp/1.txt
+        - name: deploy
+          type: scp
+          host: "${SERVER_ADDRESS}"
+          port: "${SERVER_PORT_1}"
+          user: "${SERVER_USER}"
+          auth: password
+          secret: tq-pass
+          local: "/tmp/1.txt"
+          remote: "/tmp/1.txt"
+
+        

@@ -11,8 +11,8 @@ import (
 
 // Step 代表一个构建步骤
 type Step struct {
-	Name   string // "shell"、"lua"、"ssh"、"scp" 或 "sync"
-	Type   string // "shell"、"lua"、"ssh"、"scp" 或 "sync"
+	Name   string // "shell"、"lua"、"ssh"、"scp"、"sync"、"sign" 或 "verify"
+	Type   string // "shell"、"lua"、"ssh"、"scp"、"sync"、"sign" 或 "verify"
 	Script string // 内联脚本内容
 	Source string // 外部脚本文件路径
 
@@ -46,6 +46,18 @@ type Step struct {
 	// Delete 镜像删除（仅 sync）：远端存在但本地不存在的文件/目录是否删除。
 	// 缺省 true（nil 视为 true），传 false 保留远端多余文件
 	Delete *bool
+
+	// 以下为数字签名配置（仅 type: sign / verify 生效），路径均相对 workDir
+	// File 待签名/待验签的文件（sign/verify 必填）
+	File string
+	// Output 签名输出路径（仅 sign）：空表示 <file>.sig
+	Output string
+	// Signature 待校验的签名文件路径（仅 verify）：空表示 <file>.sig
+	Signature string
+	// PublicKey 验签公钥文件路径（仅 verify）：与 Secret 二选一
+	PublicKey string
+	// Algorithm 签名算法：rsa-sha256 / ecdsa-sha256 / ed25519；空表示按密钥类型识别
+	Algorithm string
 }
 
 // Executor 定义执行器接口
@@ -104,6 +116,10 @@ func (r *Runner) Execute(step Step, workDir string, env map[string]string, logFn
 		return r.runScp(step, env, logFn)
 	case "sync":
 		return r.runSync(step, env, logFn)
+	case "sign":
+		return r.runSign(step, workDir, env, logFn)
+	case "verify":
+		return r.runVerify(step, workDir, env, logFn)
 	default:
 		return "", fmt.Errorf("unknown step type: %q", step.Type)
 	}

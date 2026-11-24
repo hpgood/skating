@@ -483,8 +483,8 @@ func gitBranch(dir string) string {
 type executorAdapter struct {
 	runner  *executor.Runner
 	workDir string
-	// secrets 全局 secret 存储：ssh 步骤的 secret 字段是名字，
-	// 执行前在这里 resolve 出真实密码/私钥，不落 yaml、不进日志
+	// secrets 全局 secret 存储：ssh/scp/sync/sign/verify 步骤的 secret 字段是名字，
+	// 执行前在这里 resolve 出真实内容（密码/私钥/公钥），不落 yaml、不进日志
 	secrets *store.Store
 }
 
@@ -515,23 +515,38 @@ func (a *executorAdapter) Execute(step pipeline.Step, env map[string]string, log
 		Local:         step.Local,
 		Remote:        step.Remote,
 		Delete:        step.Delete,
+		File:          step.File,
+		Output:        step.Output,
+		Signature:     step.Signature,
+		PublicKey:     step.PublicKey,
+		Algorithm:     step.Algorithm,
 	}
-	// ssh/scp/sync 步骤：把 yaml 中的 secret 名字 resolve 成真实认证材料。
+	// ssh/scp/sync/sign 步骤：把 yaml 中的 secret 名字 resolve 成真实材料；
+	// verify 仅在填写了 secret（公钥来自 secret）时 resolve。
 	// 失败时直接让 step 失败，错误信息只含 secret 名，不泄露值
-	if step.Type == "ssh" || step.Type == "scp" || step.Type == "sync" {
+	switch step.Type {
+	case "ssh", "scp", "sync", "sign":
 		val, err := a.resolveSecret(step.Name, step.Secret)
 		if err != nil {
 			return "", err
 		}
 		es.Secret = val
+	case "verify":
+		if step.Secret != "" {
+			val, err := a.resolveSecret(step.Name, step.Secret)
+			if err != nil {
+				return "", err
+			}
+			es.Secret = val
+		}
 	}
 	return a.runner.Execute(es, a.workDir, stepEnv, logFn)
 }
 
-// resolveSecret 从全局 secret 存储读取 ssh 认证材料
+// resolveSecret 从全局 secret 存储读取步骤所需的认证材料（密码/私钥/公钥）
 func (a *executorAdapter) resolveSecret(stepName, secretName string) (string, error) {
 	if secretName == "" {
-		return "", fmt.Errorf("step %q: ssh secret is required (skating secret set <name>, then set secret: <name> in yaml)", stepName)
+		return "", fmt.Errorf("step %q: secret is required (skating secret set <name>, then set secret: <name> in yaml)", stepName)
 	}
 	if a.secrets == nil {
 		return "", fmt.Errorf("step %q: secret store unavailable", stepName)

@@ -7,9 +7,10 @@ A lightweight CI/CD automation tool — Jenkins-like power, single binary simpli
 ## Features
 
 - **Zero-dependency deploy** — Single binary, no database, all data in local YAML files
-- **Three-layer architecture** — Pipeline DSL + Shell/Lua/SSH/SCP/Sync executor + Yaegi plugin system
+- **Three-layer architecture** — Pipeline DSL + Shell/Lua/SSH/SCP/Sync/Sign executor + Yaegi plugin system
 - **Docker sandbox** — Isolated builds inside containers for consistent environments
 - **Remote deploy** — Native SSH executor plus SFTP-based scp/sync file transfer
+- **Artifact signing** — Detached RSA/ECDSA/Ed25519 signatures and verification, keys from `skating secret`
 - **Cross-platform** — Windows / Linux / macOS
 
 ## vs Drone
@@ -331,7 +332,7 @@ Behavior:
 ┌─────────────────────────────┐
 │  Pipeline DSL (YAML)        │  ← Stage / Parallel / When orchestration
 ├─────────────────────────────┤
-│  Executor                   │  ← Shell + Lua + SSH/SCP/Sync
+│  Executor                   │  ← Shell + Lua + SSH/SCP/Sync + Sign/Verify
 ├─────────────────────────────┤
 │  Plugins (Yaegi)            │  ← Go plugins: notifications, reviewers, etc.
 └─────────────────────────────┘
@@ -597,7 +598,70 @@ Behavior notes:
   of silently targeting a wrong host. `port` may be written as a number or a
   string (`port: 22` or `port: "${SERVER_PORT}"`); an invalid value is reported
   before connecting.
+- SSH scripts run through remote `bash -x -s`, so each command is traced
+  (`+ ...`) in the live log for easier debugging.
 - Build cancellation / timeout closes the SSH connection automatically.
+
+## Digital Signature (Sign / Verify)
+
+`type: sign` produces a detached signature for a single file; `type: verify`
+validates it. Both are built in (no external `gpg`/`openssl` binary) and use
+`golang.org/x/crypto`/stdlib crypto only.
+
+The private key is stored with `skating secret set <name> --from-file <keyfile>`
+and referenced by name; the key never appears in the yaml or logs.
+
+```yaml
+steps:
+  - name: sign-artifact
+    type: sign
+    secret: release-signing-key      # required; private key name
+    file: dist/app.tar.gz            # required; ${VAR} supported
+    output: dist/app.tar.gz.sig      # optional; default <file>.sig
+    algorithm: rsa-sha256            # optional; auto-detected from the key
+
+  - name: verify-artifact
+    type: verify
+    file: dist/app.tar.gz            # required
+    signature: dist/app.tar.gz.sig   # optional; default <file>.sig
+    public_key: keys/release.pub     # either public_key or secret (exactly one)
+    # secret: release-pub            # ...or a public key PEM stored as a secret
+    algorithm: rsa-sha256            # optional; auto-detected from the key
+```
+
+Algorithms (auto-detected from the key unless `algorithm` is set):
+
+| Key type | Algorithm | Signature encoding |
+|---|---|---|
+| RSA | `rsa-sha256` (PKCS#1 v1.5 + SHA-256) | raw bytes |
+| ECDSA | `ecdsa-sha256` (SHA-256) | ASN.1 DER |
+| Ed25519 | `ed25519` | raw bytes |
+
+Behavior notes:
+- Key formats: x509 PEM (PKCS#8 / PKCS#1 / SEC1) and OpenSSH private keys;
+  public keys may be PKIX / PKCS#1 PEM or OpenSSH `.pub` (`authorized_keys`)
+- `file` / `output` / `signature` / `public_key` are resolved relative to the
+  project directory (same base as shell steps) and support `${VAR}` expansion;
+  undefined variables are kept as-is
+- The `.sig` file is a single standard base64 line (with padding) terminated by
+  `\n`. Verification trims surrounding whitespace and also accepts base64
+  without padding, so `openssl base64 -A` output verifies too
+- Existing `.sig` files are overwritten; the parent directory of `output` is
+  created automatically
+- `verify` requires exactly one of `public_key` / `secret`; a mismatch fails the
+  step (and the build), while parse/format errors report the expected key kind
+- Encrypted (passphrase-protected) private keys are not supported — decrypt the
+  key first (e.g. `openssl pkey -in key.pem -out plain.pem`)
+- Ed25519 signs the whole file in memory; for very large artifacts prefer
+  RSA/ECDSA, which stream the SHA-256 hash
+- Signature covers the raw file bytes (no newline conversion on Windows/Linux)
+
+Cross-check with OpenSSL (RSA example):
+```bash
+# Verify a skating .sig against the public key
+openssl dgst -sha256 -verify keys/release.pem \
+  -signature dist/app.tar.gz.sig dist/app.tar.gz
+```
 
 ## Data Storage
 

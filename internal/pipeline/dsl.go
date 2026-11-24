@@ -15,7 +15,7 @@ import (
 // Step 表示 pipeline 中的一个执行步骤
 type Step struct {
 	Name   string                       `yaml:"name"`
-	Type   string                       `yaml:"type"`   // shell、lua 或 ssh
+	Type   string                       `yaml:"type"`   // shell、lua、ssh、scp、sync、sign 或 verify
 	Script string                       `yaml:"script"` // 内联脚本
 	Source string                       `yaml:"source"` // 外部脚本路径
 	When   string                       `yaml:"when"`   // 条件表达式
@@ -44,8 +44,8 @@ type Step struct {
 	// Auth 认证方式："password" 或 "key"，缺省 "password"
 	Auth string `yaml:"auth"`
 	// Secret 是全局 secret 的名字（skating secret set <name> 保存），
-	// 运行时从 ~/.skating/secrets.json resolve 出真实密码/私钥。
-	// yaml 中只保存名字，不保存认证材料本身
+	// 运行时从 ~/.skating/secrets.json resolve 出真实内容：SSH 的密码/私钥、
+	// sign 的签名私钥、verify 的验签公钥。yaml 中只保存名字，不保存材料本身
 	Secret string `yaml:"secret"`
 
 	// 以下为文件传输字段（仅 type: scp / sync 生效）
@@ -58,6 +58,20 @@ type Step struct {
 	// Delete 镜像删除（仅 sync）：远端存在但本地不存在的文件/目录是否删除。
 	// 缺省 true（不写该字段即删除），传 false 保留远端多余文件
 	Delete *bool `yaml:"delete"`
+
+	// 以下为数字签名字段（仅 type: sign / verify 生效），路径均相对项目目录
+	// File 待签名/待验签的文件（sign/verify 必填），支持 ${VAR} 展开
+	File string `yaml:"file"`
+	// Output 签名输出路径（仅 sign，可选）：缺省 <file>.sig；支持 ${VAR} 展开
+	Output string `yaml:"output"`
+	// Signature 待校验的签名文件路径（仅 verify，可选）：缺省 <file>.sig；
+	// 支持 ${VAR} 展开
+	Signature string `yaml:"signature"`
+	// PublicKey 验签公钥文件路径（仅 verify）：与 secret 二选一；支持 ${VAR} 展开
+	PublicKey string `yaml:"public_key"`
+	// Algorithm 签名算法（可选）：rsa-sha256 / ecdsa-sha256 / ed25519，
+	// 缺省按私钥/公钥类型自动识别；显式指定时必须与密钥类型一致
+	Algorithm string `yaml:"algorithm"`
 
 	// StageName 运行时由 runner 填充所属 stage 名（不参与 yaml 序列化），
 	// 供上层适配器做进度上报等用途
